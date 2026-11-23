@@ -10,42 +10,29 @@ import {
 import { catAudio } from './audio';
 import { resolveCustomSkin, type CatSkinConfig, type ResolvedSkin } from './catSkins';
 import { DaFeiYuRenderer, type DaFeiYuLayout } from './dafeiyuRenderer';
+import {
+  DESK_KEYBOARD_WIDTH, DESK_KEYBOARD_DEPTH, DESK_TRACKPAD_SLOT_WIDTH, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH,
+  DESK_DEVICE_GAP, DESK_CENTER_Y, DESK_KEYS_SIDE_INSET, DESK_KEYS_TOP_INSET, DESK_KEYS_BOTTOM_INSET,
+  LOW_PROFILE_LAYOUT, projectDeskPoint, resolveLowProfileKey, traceDeskRect,
+} from './deskLayout';
+import { advancePaw, createPaw, damp, spring, type PawState, type Vec2 } from './pawMotion';
+import { isTailKey, TailStrike } from './tailStrike';
 
 export const LOGICAL_W = 420;
 export const LOGICAL_H = 440;
+const TRACKPAD_GLIDE_IDLE_MS = 170;
+const TRACKPAD_PAW_DWELL_MS = 2200;
+const VIEWER_DEVICE_GAP = 10;
+const VIEWER_MOUSE_TRAVEL_X = 6;
+const VIEWER_MOUSE_TRAVEL_Y = 5;
+const TRACKPAD_REAR_HALF_WIDTH = 27;
+const TRACKPAD_FRONT_HALF_WIDTH = 29;
+const MOUSE_HALF_WIDTH = 18.5;
+const TRACKPAD_LEFT_COLOR = '#d4f044';
+const TRACKPAD_RIGHT_COLOR = '#ff7b3b';
 export type CatBreed = 'black' | 'ragdoll' | 'dafeiyu';
 export type KeyboardOrientation = 'cat' | 'viewer';
-
-interface Vec2 {
-  x: number;
-  y: number;
-}
-
-interface SmearFrame {
-  sx: number;
-  sy: number;
-  px: number;
-  py: number;
-  alpha: number;
-}
-
-type PawMode = 'idle' | 'curled' | 'poke' | 'mouse';
-
-interface PawState {
-  side: 'left' | 'right';
-  shoulderNormY: number; // vertical fraction along spine (0=ear tips, 1=base)
-  shoulderHalfX: number;
-  pos: Vec2;
-  vel: Vec2;
-  target: Vec2;
-  mode: PawMode;
-  idleWeight: number;
-  curlWeight: number;
-  pokeTime: number;
-  impactSquash: number;
-  lastActiveAt: number;
-  smears: SmearFrame[];
-}
+export type PointerDevice = 'mouse' | 'trackpad';
 
 interface KeyBubble {
   id: number;
@@ -98,15 +85,18 @@ export class KuroCatEngine {
   private renderScale = 1.0;
   private embedded = false;
   private dafeiyu = new DaFeiYuRenderer();
+  private readonly tailStrike = new TailStrike();
   private privacyClose = 0;
   private privacyTypingAt = -10000;
   private lastMouseNX = 0.5;
+  private lastMouseNY = 0.5;
   private lastDt = 1 / 60;
 
   public setPrivacyMode(active: boolean): void {
     this.privacyMode = active;
     this.dafeiyu.onPrivacyModeChanged(active);
     if (active) {
+      this.tailStrike.cancel(this.tailRestTip());
       this.bubbles.length = 0;
       for (const anim of this.keyAnims.values()) {
         anim.pressed = false;
@@ -159,6 +149,67 @@ export class KuroCatEngine {
       this.mouseBaseX = isBigFish ? 72 : 46;
       this.mouseBaseY = isBigFish ? 322 : 338;
     }
+
+    if (this.usesLowProfileDesk) {
+      this.layoutLowProfileDesk();
+    } else if (this.keyboardOrientation === 'viewer') {
+      this.kbCenterX = this.logicalW - this.kbCenterX;
+      const clearance = this.pointerDevice === 'trackpad'
+        ? TRACKPAD_FRONT_HALF_WIDTH
+        : MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X;
+      const alongKeyboard = this.kbWidth * 0.5 + VIEWER_DEVICE_GAP + clearance;
+      this.mouseBaseX = this.kbCenterX + alongKeyboard * Math.cos(this.kbTiltRad);
+      this.mouseBaseY = this.kbCenterY + alongKeyboard * Math.sin(this.kbTiltRad);
+    }
+
+    if (this.leftPaw && this.rightPaw) {
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        if (paw.mode !== 'idle' || paw.exposure > 0) continue;
+        paw.pos = this.tuckedPawPosition(paw.side);
+        paw.target = { ...paw.pos };
+        paw.vel = { x: 0, y: 0 };
+      }
+    }
+  }
+
+  private layoutLowProfileDesk(): void {
+    const direction = this.keyboardOrientation === 'viewer' ? 1 : -1;
+    const trackpad = this.pointerDevice === 'trackpad';
+    const deviceSlotWidth = trackpad ? DESK_TRACKPAD_SLOT_WIDTH : (MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X) * 2;
+    const deviceWidth = trackpad ? DESK_TRACKPAD_WIDTH : deviceSlotWidth;
+    this.kbWidth = DESK_KEYBOARD_WIDTH;
+    this.kbHeight = DESK_KEYBOARD_DEPTH;
+    this.kbCenterY = DESK_CENTER_Y;
+    this.kbTiltRad = 0;
+    this.kbCenterX = this.logicalW / 2 - direction * (DESK_DEVICE_GAP + deviceSlotWidth) / 2;
+    const catOffset = trackpad && direction === 1 ? 28 : 12;
+    this.catCenterX = this.kbCenterX + direction * catOffset;
+    this.mouseBaseX = this.kbCenterX + direction * (this.kbWidth / 2 + DESK_DEVICE_GAP + deviceWidth / 2);
+    const deviceDepth = trackpad ? DESK_TRACKPAD_DEPTH : 48;
+    this.mouseBaseY = this.kbCenterY + (this.kbHeight - deviceDepth) / 2;
+  }
+
+  private get usesLowProfileDesk(): boolean {
+    return this.personalDesk && this.keyboardLayout === '65';
+  }
+
+  private get currentLayout() {
+    return this.usesLowProfileDesk ? LOW_PROFILE_LAYOUT : getKeyboardLayout(this.keyboardLayout);
+  }
+
+  private resolveKey(vk: number): KeySpec | null {
+    return this.usesLowProfileDesk ? resolveLowProfileKey(vk) : resolveKeyByVk(vk, this.keyboardLayout);
+  }
+
+  private projectDesk(x: number, y: number): Vec2 {
+    return projectDeskPoint(x, y, this.logicalW / 2);
+  }
+
+  private getTrackpadContactWorld(): Vec2 {
+    const contact = this.getTrackpadContact();
+    const x = this.mouseBaseX + contact.x;
+    const y = this.mouseBaseY + contact.y;
+    return this.usesLowProfileDesk ? this.projectDesk(x, y) : { x, y };
   }
 
   public setCatAppearance(breedId: string, skin?: CatSkinConfig | null): void {
@@ -176,26 +227,72 @@ export class KuroCatEngine {
       this.customSkin = null;
     }
     this.syncLayoutPositions();
+    if (!this.isSolidBlackCat) this.tailStrike.cancel(this.tailRestTip());
   }
 
   public setKeyboardConfig(layout: KeyboardLayoutId, orientation: KeyboardOrientation): void {
     const nextLayout: KeyboardLayoutId = layout === '108' ? '108' : '65';
     const nextOrientation: KeyboardOrientation = orientation === 'viewer' ? 'viewer' : 'cat';
     const layoutChanged = this.keyboardLayout !== nextLayout;
+    if (layoutChanged || this.keyboardOrientation !== nextOrientation) {
+      this.tailStrike.cancel(this.tailRestTip());
+    }
+    if (this.keyboardOrientation !== nextOrientation) {
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        if (paw.mode === 'mouse') paw.mode = 'idle';
+      }
+      this.mouseBadges = [];
+    }
     this.keyboardLayout = nextLayout;
     this.keyboardOrientation = nextOrientation;
 
     this.syncLayoutPositions();
 
     if (layoutChanged) {
-      this.leftPaw.pos = { x: this.catCenterX - 18, y: this.catBaseY };
-      this.leftPaw.target = { x: this.catCenterX - 18, y: this.catBaseY };
-      this.rightPaw.pos = { x: this.catCenterX + 18, y: this.catBaseY };
-      this.rightPaw.target = { x: this.catCenterX + 18, y: this.catBaseY };
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        paw.mode = 'idle';
+      }
     }
   }
 
-  private buildDaFeiYuLayout(): DaFeiYuLayout {
+  public setPointerDevice(device: PointerDevice): void {
+    if (device === this.pointerDevice) return;
+    this.tailStrike.cancel(this.tailRestTip());
+    this.pointerDevice = device;
+    this.syncLayoutPositions();
+    this.mouseBadges = [];
+    this.trackpadContact = { x: 0, y: 0 };
+    this.trackpadContactTarget = { x: 0, y: 0 };
+    if (device === 'mouse' && this.keyboardPaw.mode === 'mouse') {
+      this.keyboardPaw.mode = 'idle';
+    }
+  }
+
+  private get isSolidBlackCat(): boolean {
+    return this.catBreed === 'black' && !this.customSkin;
+  }
+
+  private get pointerPaw(): PawState {
+    return this.keyboardOrientation === 'viewer' ? this.rightPaw : this.leftPaw;
+  }
+
+  private get keyboardPaw(): PawState {
+    return this.keyboardOrientation === 'viewer' ? this.leftPaw : this.rightPaw;
+  }
+
+  private getTrackpadContact(): Vec2 {
+    return {
+      x: this.trackpadContact.x,
+      y: Math.max(-10, Math.min(10, this.trackpadContact.y + this.trackpadScrollOffset)),
+    };
+  }
+
+  private isTrackpadActive(now: number, idleMs = TRACKPAD_PAW_DWELL_MS): boolean {
+    return this.mouseLeftDown || this.mouseRightDown || this.mouseMiddleDown ||
+      now - this.lastMouseMoveAt < idleMs;
+  }
+
+  private buildDaFeiYuLayout(now: number): DaFeiYuLayout {
     const mx = this.mouseBaseX + this.mouseOffsetX;
     const my = this.mouseBaseY + this.mouseOffsetY;
     const isCatFacing = this.keyboardOrientation === 'cat';
@@ -204,19 +301,28 @@ export class KuroCatEngine {
     const ang = this.kbTiltRad + (isCatFacing ? Math.PI : 0);
     const c = Math.cos(ang);
     const s = Math.sin(ang);
+    const contact = this.getTrackpadContactWorld();
     return {
+      charX: this.usesLowProfileDesk ? this.catCenterX - 4 : this.keyboardLayout === '108' ? 268 : 192,
       logicalW: this.logicalW,
       kbCenterX: this.kbCenterX,
       kbCenterY: this.kbCenterY,
       kbWidth: this.kbWidth,
       kbHeight: this.kbHeight,
       kbTiltRad: this.kbTiltRad,
-      mouseBtnX: mx + localBtnX * c - localBtnY * s,
-      mouseBtnY: my + localBtnX * s + localBtnY * c,
+      mouseBtnX: this.pointerDevice === 'trackpad'
+        ? contact.x
+        : mx + localBtnX * c - localBtnY * s,
+      mouseBtnY: this.pointerDevice === 'trackpad'
+        ? contact.y
+        : my + localBtnX * s + localBtnY * c,
       mouseNX: this.lastMouseNX,
+      pointerOnRight: !isCatFacing,
       mouseLeft: this.mouseLeftDown,
       mouseRight: this.mouseRightDown,
-      mouseActiveAt: this.lastMouseMoveAt,
+      mouseActive: this.pointerDevice === 'trackpad'
+        ? this.isTrackpadActive(now)
+        : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 900,
       petEnergy: this.petEnergy,
       privacyMode: this.privacyMode,
       privacyTypingAt: this.privacyTypingAt,
@@ -239,7 +345,12 @@ export class KuroCatEngine {
   private kbHeight = 74;
   private kbTiltRad = (3.4 * Math.PI) / 180;
 
-  // True-scale white oval mouse to the left of keyboard
+  // Position and animation for the mouse or trackpad
+  private pointerDevice: PointerDevice = 'mouse';
+  private trackpadContact: Vec2 = { x: 0, y: 0 };
+  private trackpadContactTarget: Vec2 = { x: 0, y: 0 };
+  private trackpadScrollDirection = 1;
+  private trackpadScrollOffset = 0;
   private mouseBaseX = 46;
   private mouseBaseY = 338;
   private mouseOffsetX = 0;
@@ -273,7 +384,9 @@ export class KuroCatEngine {
   private faceTurnX = 0;
 
   // Spine-shear deformation state (exact measured flexible cat spine + playful typing body/head sway!)
-  private spineLean = 0;    // -1 (mouse lean: head shifts -46px left while hips stay anchored!) .. +1
+  private hindPawLift = 0;
+  private spineLean = 0;
+  private spineLeanVelocity = 0;
   private headTilt = 0;
   private typingHunch = 0;  // 0..1 lowers head & rounds posture slightly when typing
   private typingSway = 0;   // -1..+1 lively left-right torso & head sway while typing!
@@ -283,6 +396,7 @@ export class KuroCatEngine {
   private strikeRock = 0;
   private strikeRockVel = 0;
   private bodyBob = 0;
+  private bodyImpact = 0;
   private kbBounce = 0;
 
   // Blinking, petting, ear micro-twitch, typing rhythm
@@ -310,14 +424,18 @@ export class KuroCatEngine {
   private bubbles: KeyBubble[] = [];
   private nextBubbleId = 1;
 
-  constructor(canvas: HTMLCanvasElement, options?: { embedded?: boolean }) {
+  private readonly personalDesk: boolean;
+
+  constructor(canvas: HTMLCanvasElement, options?: { embedded?: boolean; personalDesk?: boolean }) {
     this.canvas = canvas;
     this.embedded = Boolean(options?.embedded);
+    this.personalDesk = Boolean(options?.personalDesk);
+    this.syncLayoutPositions();
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not initialize 2D canvas context');
     this.ctx = ctx;
 
-    for (const k of KEYBOARD_KEYS_65) {
+    for (const k of this.personalDesk ? LOW_PROFILE_LAYOUT.keys : KEYBOARD_KEYS_65) {
       this.keyAnims.set(k.id, { pressed: false, pressAmount: 0, lastHitAt: -10000 });
     }
     for (const k of KEYBOARD_KEYS_108) {
@@ -326,37 +444,8 @@ export class KuroCatEngine {
       }
     }
 
-    this.leftPaw = {
-      side: 'left',
-      shoulderNormY: 0.50,
-      shoulderHalfX: -32,
-      pos: { x: this.catCenterX - 18, y: this.catBaseY },
-      vel: { x: 0, y: 0 },
-      target: { x: this.catCenterX - 18, y: this.catBaseY },
-      mode: 'idle',
-      idleWeight: 1,
-      curlWeight: 0,
-      pokeTime: 1,
-      impactSquash: 0,
-      lastActiveAt: -10000,
-      smears: [],
-    };
-
-    this.rightPaw = {
-      side: 'right',
-      shoulderNormY: 0.50,
-      shoulderHalfX: 32,
-      pos: { x: this.catCenterX + 18, y: this.catBaseY },
-      vel: { x: 0, y: 0 },
-      target: { x: this.catCenterX + 18, y: this.catBaseY },
-      mode: 'idle',
-      idleWeight: 1,
-      curlWeight: 0,
-      pokeTime: 1,
-      impactSquash: 0,
-      lastActiveAt: -10000,
-      smears: [],
-    };
+    this.leftPaw = createPaw('left', this.tuckedPawPosition('left'));
+    this.rightPaw = createPaw('right', this.tuckedPawPosition('right'));
 
     this.resize();
     window.addEventListener('resize', () => this.resize());
@@ -366,24 +455,39 @@ export class KuroCatEngine {
     const dpr = Math.max(window.devicePixelRatio || 1, 1);
     const cssW = Math.max(1, this.embedded ? (this.canvas.clientWidth || 420) : window.innerWidth);
     const cssH = Math.max(1, this.embedded ? (this.canvas.clientHeight || 440) : window.innerHeight);
-    this.canvas.width = Math.round(cssW * dpr);
-    this.canvas.height = Math.round(cssH * dpr);
+    const pixelWidth = Math.round(cssW * dpr);
+    const pixelHeight = Math.round(cssH * dpr);
+    if (this.canvas.width === pixelWidth && this.canvas.height === pixelHeight) return;
+    this.canvas.width = pixelWidth;
+    this.canvas.height = pixelHeight;
+    if (this.rafId) this.render();
   }
 
   public start(): void {
+    if (this.rafId) return;
     this.lastTime = performance.now();
     const tick = (now: number) => {
       const dt = Math.min(0.05, Math.max(0.001, (now - this.lastTime) / 1000));
       this.lastTime = now;
-      this.update(dt, now);
+      this.advanceFrame(dt, now);
       this.render();
       this.rafId = requestAnimationFrame(tick);
     };
     this.rafId = requestAnimationFrame(tick);
   }
 
+  private advanceFrame(dt: number, now: number): void {
+    const steps = Math.ceil(dt * 120);
+    const step = dt / steps;
+    for (let remaining = steps - 1; remaining >= 0; remaining--) {
+      this.update(step, now - remaining * step * 1000);
+    }
+    this.lastDt = dt;
+  }
+
   public stop(): void {
     cancelAnimationFrame(this.rafId);
+    this.rafId = 0;
   }
 
   // ---- Flexible spine coordinate system (exact match to measured 0.3s -> 2.2s shear!) ----
@@ -406,16 +510,20 @@ export class KuroCatEngine {
   }
 
   private getLiveShoulder(paw: PawState, breath: number): Vec2 {
-    const sp = this.spinePoint(paw.shoulderNormY, breath);
+    const sp = this.spinePoint(0.50, breath);
     return {
-      x: sp.x + paw.shoulderHalfX,
+      x: sp.x + (paw.side === 'left' ? -32 : 32),
       y: sp.y,
     };
   }
 
+  private tuckedPawPosition(side: PawState['side']): Vec2 {
+    return { x: this.catCenterX + (side === 'left' ? -20 : 20), y: this.catBaseY - 19 };
+  }
+
   private getLiveCurledPawPos(paw: PawState, breath: number): Vec2 {
     // Bent forearm elbow -> cute curled paw sitting near lower belly (matches 8.3s / 10.6s!)
-    const sp = this.spinePoint(0.84, breath);
+    const sp = this.spinePoint(0.80, breath);
     const bob = Math.sin(this.elapsed * 12 + (paw.side === 'left' ? 0 : Math.PI)) * (1.5 + this.typingEnergy * 2.0);
     const xOff = paw.side === 'left' ? -24 : 24;
     return {
@@ -432,11 +540,12 @@ export class KuroCatEngine {
       return;
     }
     const now = performance.now();
-    const spec = resolveKeyByVk(vk, this.keyboardLayout);
+    const spec = this.resolveKey(vk);
     if (!spec) return;
 
+    const tailKey = this.personalDesk && this.isSolidBlackCat && isTailKey(vk);
     const anim = this.keyAnims.get(spec.id);
-    if (anim) {
+    if (anim && !tailKey) {
       anim.pressed = true;
       anim.pressAmount = 1;
       anim.lastHitAt = now;
@@ -448,12 +557,24 @@ export class KuroCatEngine {
     this.recentKeyTimes.push(now);
     if (this.recentKeyTimes.length > 26) this.recentKeyTimes.shift();
 
-    this.bodyBob = Math.min(1.15, this.bodyBob + 0.65);
+    if (tailKey) {
+      const point = spec.id === 'space'
+        ? this.projectKeyboardPoint(
+          spec.uStart + spec.uWidth * (this.keyboardOrientation === 'viewer' ? 0.85 : 0.15),
+          (spec.rowY ?? spec.row) + 0.5,
+        )
+        : this.getKeyWorldCenter(spec);
+      point.y -= 8;
+      this.tailStrike.request({ id: spec.id, label: formatBubbleForVk(vk, spec), point }, this.tailRestTip());
+      return;
+    }
+
+    this.bodyImpact = Math.min(1.15, this.bodyImpact + 0.65);
     this.kbBounce = Math.min(1, this.kbBounce + 0.45);
 
     if (this.catBreed === 'dafeiyu') {
       const pt = this.getKeyWorldCenter(spec);
-      this.dafeiyu.onKeyDown(vk, pt, this.buildDaFeiYuLayout(), repeat);
+      this.dafeiyu.onKeyDown(vk, pt, this.buildDaFeiYuLayout(now), repeat);
       if (this.showKeyBubbles) {
         const label = formatBubbleForVk(vk, spec);
         if (label) {
@@ -468,19 +589,21 @@ export class KuroCatEngine {
       else this.earTwitchRight = 1;
     }
 
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const keyColCenter = spec.uStart + spec.uWidth * 0.5;
     const screenKeyCol = isCatFacing ? layout.totalUnits - keyColCenter : keyColCenter;
     const midCol = layout.totalUnits * 0.5;
     const keyBias = Math.max(-1, Math.min(1, (screenKeyCol - midCol) / (layout.totalUnits * 0.34)));
     this.lastKeyBias = keyBias;
-    this.typingGroovePhase += 1.22;
+
 
     let targetPoint = this.getKeyWorldCenter(spec);
     let chosen: PawState;
 
-    const activelyMousing = this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 320;
+    const activelyMousing = this.pointerDevice === 'trackpad'
+      ? this.isTrackpadActive(now, 320)
+      : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 320;
     const splitCol =
       this.keyboardLayout === '108'
         ? isCatFacing
@@ -490,7 +613,7 @@ export class KuroCatEngine {
 
     if (spec.id === 'space') {
       if (activelyMousing) {
-        chosen = this.rightPaw;
+        chosen = this.keyboardPaw;
       } else {
         this.lastSpacePaw = this.lastSpacePaw === 'left' ? 'right' : 'left';
         chosen = this.lastSpacePaw === 'left' ? this.leftPaw : this.rightPaw;
@@ -505,7 +628,7 @@ export class KuroCatEngine {
       const rY = spec.rowY ?? spec.row;
       targetPoint = this.projectKeyboardPoint(spaceU, rY + 0.50);
     } else if (activelyMousing) {
-      chosen = this.rightPaw;
+      chosen = this.keyboardPaw;
     } else if (screenKeyCol < splitCol) {
       chosen = this.leftPaw;
     } else {
@@ -519,33 +642,14 @@ export class KuroCatEngine {
       this.typingSwayVel += (keyBias * 2.1 + Math.cos(this.typingGroovePhase) * 1.65) * (0.9 + this.typingEnergy * 0.45);
     }
 
-    const prevShoulder = this.getLiveShoulder(chosen, 0);
-    if (chosen.mode === 'poke' && Math.hypot(targetPoint.x - chosen.pos.x, targetPoint.y - chosen.pos.y) > 22) {
-      chosen.smears.push({
-        sx: prevShoulder.x,
-        sy: prevShoulder.y,
-        px: chosen.pos.x,
-        py: chosen.pos.y,
-        alpha: 0.28,
-      });
-      if (chosen.smears.length > 3) chosen.smears.shift();
-    }
-
-    if (chosen.mode === 'curled' || chosen.mode === 'idle') {
-      const startPt = this.getLiveCurledPawPos(chosen, 0);
-      chosen.pos = { x: startPt.x, y: startPt.y };
-      chosen.vel = { x: 0, y: 0 };
-    }
     chosen.mode = 'poke';
     chosen.target = this.clampToKeyboardSurface(targetPoint);
     chosen.pokeTime = 0;
-    chosen.impactSquash = 0.85;
-    chosen.lastActiveAt = now;
+    chosen.impact = 0.85;
 
     const other = chosen.side === 'left' ? this.rightPaw : this.leftPaw;
-    if (other.mode === 'idle' && !activelyMousing) {
+    if (!this.isSolidBlackCat && other.mode === 'idle' && !activelyMousing) {
       other.mode = 'curled';
-      other.lastActiveAt = now;
     }
 
     if (this.showKeyBubbles) {
@@ -559,7 +663,7 @@ export class KuroCatEngine {
   public onKeyUp(vk: number): void {
     this.dafeiyu.onKeyUp(vk);
     if (this.privacyMode) return;
-    const spec = resolveKeyByVk(vk, this.keyboardLayout);
+    const spec = this.resolveKey(vk);
     if (!spec) return;
     const anim = this.keyAnims.get(spec.id);
     if (anim) anim.pressed = false;
@@ -567,13 +671,23 @@ export class KuroCatEngine {
 
   public onGlobalMouseMove(nx: number, ny: number): void {
     const now = performance.now();
+    if (this.pointerDevice === 'trackpad') {
+      if (nx === this.lastMouseNX && ny === this.lastMouseNY) return;
+      if (now - this.lastMouseMoveAt >= TRACKPAD_GLIDE_IDLE_MS) {
+        this.trackpadContactTarget.x = this.trackpadContact.x;
+        this.trackpadContactTarget.y = this.trackpadContact.y;
+      }
+      const target = this.trackpadContactTarget;
+      target.x = Math.max(-13, Math.min(13, target.x + (nx - this.lastMouseNX) * 190));
+      target.y = Math.max(-9, Math.min(9, target.y + (ny - this.lastMouseNY) * 145));
+    }
     this.lastMouseNX = nx;
+    this.lastMouseNY = ny;
     this.mouseTargetOffsetX = (nx - 0.5) * (this.catBreed === 'dafeiyu' ? 14 : 28);
     this.mouseTargetOffsetY = (ny - 0.5) * (this.catBreed === 'dafeiyu' ? 11 : 20);
     this.lastMouseMoveAt = now;
 
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.lastActiveAt = now;
+    if (this.pointerPaw.mode !== 'poke') this.pointerPaw.mode = 'mouse';
   }
 
   private getMouseButtonColors(): { left: string; right: string; middle: string } {
@@ -592,6 +706,10 @@ export class KuroCatEngine {
           ? '#4690d8'
           : '#92ba12';
 
+    if (this.pointerDevice === 'trackpad') {
+      return { left: TRACKPAD_LEFT_COLOR, right: TRACKPAD_RIGHT_COLOR, middle: scroll };
+    }
+
     // Pick a high-contrast complementary color for RMB so Left vs Right click are unmistakable on every skin
     const isWarmAccent = /^#(f[a-f0-9][89a-c]|ff[789a-c]|e[89a-f][789a])/i.test(primary);
     const rightColor = isWarmAccent ? '#58c7ff' : '#ff7b3b';
@@ -603,8 +721,13 @@ export class KuroCatEngine {
     const colors = this.getMouseButtonColors();
     const label = button === 'left' ? 'LMB' : button === 'right' ? 'RMB' : 'MMB';
     const color = button === 'left' ? colors.left : button === 'right' ? colors.right : colors.middle;
-    const mx = this.mouseBaseX + this.mouseOffsetX;
-    const my = this.mouseBaseY + this.mouseOffsetY;
+    const trackpad = this.pointerDevice === 'trackpad';
+    const anchor = trackpad
+      ? this.getTrackpadContactWorld()
+      : { x: this.mouseBaseX + this.mouseOffsetX, y: this.mouseBaseY + this.mouseOffsetY };
+    const badgeY = trackpad
+      ? this.mouseBaseY - (this.usesLowProfileDesk ? DESK_TRACKPAD_DEPTH / 2 + 12 : 29)
+      : anchor.y - 30;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const sideShift =
       button === 'left'
@@ -624,8 +747,8 @@ export class KuroCatEngine {
       id: this.nextBubbleId++,
       label,
       color,
-      x: Math.max(24, mx + sideShift),
-      y: my - 30,
+      x: Math.max(24, Math.min(this.logicalW - 24, anchor.x + sideShift)),
+      y: badgeY,
       createdAt: now,
       lifetime: 560,
     });
@@ -641,6 +764,10 @@ export class KuroCatEngine {
       this.mouseRightDown = true;
       this.mouseRightPress = 1;
       this.spawnMouseBadge('right', now);
+      if (this.pointerDevice === 'trackpad' && this.keyboardPaw.mode !== 'poke') {
+        this.keyboardPaw.mode = 'mouse';
+        this.keyboardPaw.impact = 0.72;
+      }
     } else if (button === 'middle') {
       this.mouseMiddleDown = true;
       this.mouseMiddlePress = 1;
@@ -648,10 +775,9 @@ export class KuroCatEngine {
     }
 
     this.lastMouseMoveAt = now;
-    this.dafeiyu.resetLeftHandForMouse();
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.impactSquash = 0.72;
-    this.leftPaw.lastActiveAt = now;
+    this.dafeiyu.resetPointerHand(this.keyboardOrientation === 'viewer');
+    this.pointerPaw.mode = 'mouse';
+    this.pointerPaw.impact = 0.72;
   }
 
   public onMouseUp(button: string): void {
@@ -660,13 +786,13 @@ export class KuroCatEngine {
     else if (button === 'middle') this.mouseMiddleDown = false;
   }
 
-  public onMouseWheel(): void {
+  public onMouseWheel(delta = 0): void {
     const now = performance.now();
+    if (delta !== 0) this.trackpadScrollDirection = Math.sign(delta);
     this.mouseScrollFlash = 1;
     this.lastMouseMoveAt = now;
-    this.dafeiyu.resetLeftHandForMouse();
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.lastActiveAt = now;
+    this.dafeiyu.resetPointerHand(this.keyboardOrientation === 'viewer');
+    this.pointerPaw.mode = 'mouse';
   }
 
   public onWindowCursor(relX: number, relY: number, overCat: boolean): void {
@@ -694,10 +820,15 @@ export class KuroCatEngine {
   // ---- Keyboard projection ----
 
   private projectKeyboardPoint(uCol: number, rowPos: number): Vec2 {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const screenU = isCatFacing ? layout.totalUnits - uCol : uCol;
     const screenRow = isCatFacing ? layout.totalRows - rowPos : rowPos;
+
+    if (this.usesLowProfileDesk) {
+      const bounds = this.lowProfileKeyBounds();
+      return this.projectDesk(bounds.left + screenU * bounds.unitWidth, bounds.top + screenRow * bounds.rowHeight);
+    }
 
     const padX = 7;
     const padY = 6;
@@ -719,7 +850,7 @@ export class KuroCatEngine {
   }
 
   private getKeyWorldCenter(spec: KeySpec): Vec2 {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const uClamped = Math.max(0.65, Math.min(layout.totalUnits - 0.65, spec.uStart + spec.uWidth * 0.5));
     const rY = spec.rowY ?? spec.row;
@@ -734,6 +865,13 @@ export class KuroCatEngine {
   }
 
   private clampToKeyboardSurface(pt: Vec2): Vec2 {
+    if (this.usesLowProfileDesk) {
+      const top = this.kbCenterY - this.kbHeight / 2;
+      const y = Math.max(top + 9, Math.min(top + this.kbHeight - 8, pt.y));
+      const left = this.projectDesk(this.kbCenterX - this.kbWidth / 2 + 10, y).x;
+      const right = this.projectDesk(this.kbCenterX + this.kbWidth / 2 - 10, y).x;
+      return { x: Math.max(left, Math.min(right, pt.x)), y };
+    }
     // Transform into keyboard-local space and clamp so the plump paw pad NEVER extends past the keyboard bezel!
     const dx = pt.x - this.kbCenterX;
     const dy = pt.y - this.kbCenterY;
@@ -806,6 +944,10 @@ export class KuroCatEngine {
     const mLerp = 1 - Math.exp(-28 * dt);
     this.mouseOffsetX += (this.mouseTargetOffsetX - this.mouseOffsetX) * mLerp;
     this.mouseOffsetY += (this.mouseTargetOffsetY - this.mouseOffsetY) * mLerp;
+    if (this.keyboardOrientation === 'viewer') {
+      this.mouseOffsetX = Math.max(-VIEWER_MOUSE_TRAVEL_X, Math.min(VIEWER_MOUSE_TRAVEL_X, this.mouseOffsetX));
+      this.mouseOffsetY = Math.max(-VIEWER_MOUSE_TRAVEL_Y, Math.min(VIEWER_MOUSE_TRAVEL_Y, this.mouseOffsetY));
+    }
     if (!this.mouseLeftDown && this.mouseLeftPress > 0) {
       this.mouseLeftPress = Math.max(0, this.mouseLeftPress - dt * 5.8);
     }
@@ -815,6 +957,14 @@ export class KuroCatEngine {
     if (!this.mouseMiddleDown && this.mouseMiddlePress > 0) {
       this.mouseMiddlePress = Math.max(0, this.mouseMiddlePress - dt * 5.8);
     }
+    if (!this.isTrackpadActive(now, TRACKPAD_GLIDE_IDLE_MS)) {
+      this.trackpadContactTarget.x *= Math.exp(-5 * dt);
+      this.trackpadContactTarget.y *= Math.exp(-5 * dt);
+    }
+    this.trackpadContact.x += (this.trackpadContactTarget.x - this.trackpadContact.x) * mLerp;
+    this.trackpadContact.y += (this.trackpadContactTarget.y - this.trackpadContact.y) * mLerp;
+    const scrollTarget = this.mouseScrollFlash > 0.12 ? this.trackpadScrollDirection * 7 : 0;
+    this.trackpadScrollOffset += (scrollTarget - this.trackpadScrollOffset) * (1 - Math.exp(-18 * dt));
     this.mouseScrollFlash = Math.max(0, this.mouseScrollFlash - dt * 4.5);
     this.mouseBadges = this.mouseBadges.filter((b) => now - b.createdAt < b.lifetime);
 
@@ -828,37 +978,33 @@ export class KuroCatEngine {
     const targetHunch = isTypingRecently ? 0.45 + this.typingEnergy * 0.55 : 0;
     this.typingHunch += (targetHunch - this.typingHunch) * (1 - Math.exp(-10 * dt));
 
-    const rockAcc = -this.strikeRock * 140 - this.strikeRockVel * 14;
-    this.strikeRockVel += rockAcc * dt;
-    this.strikeRock = Math.max(-1, Math.min(1, this.strikeRock + this.strikeRockVel * dt));
-
-    this.bodyBob = Math.max(0, this.bodyBob - dt * 11.5);
+    [this.strikeRock, this.strikeRockVel] = spring(this.strikeRock, this.strikeRockVel, 0, 15, dt);
+    this.bodyImpact = damp(this.bodyImpact, 0, 21, dt);
+    this.bodyBob = damp(this.bodyBob, this.bodyImpact, 32, dt);
     this.kbBounce = Math.max(0, this.kbBounce - dt * 15);
 
     // Playful left-right body & head groove sway during pure typing (matches original video first half!)
-    const pureTypingActive = isTypingRecently && this.leftPaw.mode !== 'mouse';
+    const usingPointer = this.pointerPaw.mode === 'mouse';
+    const pureTypingActive = isTypingRecently && !usingPointer;
     if (pureTypingActive) {
       this.typingGroovePhase += dt * (4.8 + this.typingEnergy * 5.2);
     }
     const grooveWave = Math.sin(this.typingGroovePhase) * (0.58 + this.typingEnergy * 0.44);
     const targetTypingSway = pureTypingActive
       ? Math.max(-1.1, Math.min(1.1, grooveWave * 0.72 + this.lastKeyBias * 0.55))
-      : this.leftPaw.mode === 'mouse' && isTypingRecently
+      : usingPointer && isTypingRecently
         ? Math.sin(this.typingGroovePhase) * 0.16
         : 0;
-    const swayAcc = (targetTypingSway - this.typingSway) * 118 - this.typingSwayVel * 12.5;
-    this.typingSwayVel += swayAcc * dt;
-    this.typingSway = Math.max(-1.2, Math.min(1.2, this.typingSway + this.typingSwayVel * dt));
+    [this.typingSway, this.typingSwayVel] = spring(this.typingSway, this.typingSwayVel, targetTypingSway, 13, dt);
 
-    // Measured spine-shear lean: shifts head & chest cleanly forward-left toward mouse while hips stay anchored!
+    // Lean toward the pointer device while the hips stay anchored.
     let targetLean = 0;
-    if (this.leftPaw.mode === 'mouse') {
-      const mouseSweepBias = (this.mouseOffsetX / 18) * 0.22;
-      targetLean = this.rightPaw.mode === 'poke'
-        ? -0.52 + mouseSweepBias
-        : -0.96 + mouseSweepBias;
+    if (usingPointer) {
+      const side = this.keyboardOrientation === 'viewer' ? 1 : -1;
+      const reach = this.keyboardPaw.mode === 'poke' ? 0.52 : 0.96;
+      targetLean = side * reach + (this.mouseOffsetX / 18) * 0.22;
     }
-    this.spineLean += (targetLean - this.spineLean) * (1 - Math.exp(-10 * dt));
+    [this.spineLean, this.spineLeanVelocity] = spring(this.spineLean, this.spineLeanVelocity, targetLean, 16, dt);
 
     const desiredHeadTilt =
       this.typingSway * 0.18 +
@@ -867,14 +1013,13 @@ export class KuroCatEngine {
     this.headTilt += (desiredHeadTilt - this.headTilt) * (1 - Math.exp(-12 * dt));
 
     this.petEnergy = Math.max(0, this.petEnergy - dt * (this.cursorOverCat ? 0.22 : 0.65));
-    this.lastDt = dt;
     const wantSquint = this.petEnergy > 0.3 ? 1 : 0;
     this.squintAmount += (wantSquint - this.squintAmount) * (1 - Math.exp(-12 * dt));
     const wantPrivacy = this.privacyMode ? 1 : 0;
     this.privacyClose += (wantPrivacy - this.privacyClose) * (1 - Math.exp(-14 * dt));
     catAudio.setPurrIntensity(!this.privacyMode && this.squintAmount > 0.25 ? this.squintAmount : 0);
     if (this.catBreed === 'dafeiyu') {
-      this.dafeiyu.update(dt, now, this.buildDaFeiYuLayout());
+      this.dafeiyu.update(dt, now, this.buildDaFeiYuLayout(now));
     }
 
     this.earTwitchLeft = Math.max(0, this.earTwitchLeft - dt * 8);
@@ -905,7 +1050,9 @@ export class KuroCatEngine {
       dx = (dx / dist) * mag;
       dy = (dy / dist) * mag;
     }
-    const mouseRecentlyMoved = now - this.lastMouseMoveAt < 2400;
+    const mouseRecentlyMoved = this.pointerDevice === 'trackpad'
+      ? this.isTrackpadActive(now)
+      : now - this.lastMouseMoveAt < 2400;
     const pureTypingGlance = mouseRecentlyMoved ? 0 : this.typingHunch;
     const targetEyeX =
       dx * 7.0 * (1 - pureTypingGlance * 0.45) +
@@ -924,8 +1071,24 @@ export class KuroCatEngine {
       }
     }
 
+    const landed = this.tailStrike.update(dt, this.tailRestTip());
+    if (landed && !this.privacyMode) {
+      const key = this.keyAnims.get(landed.id);
+      if (key) {
+        key.pressAmount = 1;
+        key.lastHitAt = now;
+      }
+      this.kbBounce = Math.min(1, this.kbBounce + 0.28);
+      this.bodyImpact = Math.min(1.15, this.bodyImpact + 0.28);
+      if (this.showKeyBubbles && landed.label) {
+        this.spawnBubble(landed.label, landed.id === 'space', landed.point.x, now);
+      }
+    }
+
     this.updatePaw(this.leftPaw, dt, now);
     this.updatePaw(this.rightPaw, dt, now);
+    const frontLift = Math.max(this.leftPaw.exposure, this.rightPaw.exposure);
+    this.hindPawLift += (frontLift - this.hindPawLift) * (1 - Math.exp(-12 * dt));
 
     const beforeLen = this.bubbles.length;
     this.bubbles = this.bubbles.filter((b) => now - b.createdAt < b.lifetime);
@@ -948,7 +1111,14 @@ export class KuroCatEngine {
       const isCatFacing = this.keyboardOrientation === 'cat';
       const lrBias = this.mouseLeftPress - this.mouseRightPress;
       const anyClickPress = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
-      if (isCatFacing) {
+      if (this.pointerDevice === 'trackpad') {
+        const contact = this.getTrackpadContactWorld();
+        const spacing = this.mouseRightPress * 6;
+        paw.target = {
+          x: contact.x + (paw.side === 'right' ? spacing : -spacing),
+          y: contact.y + anyClickPress * 2,
+        };
+      } else if (isCatFacing) {
         // 180° cat-facing: palm heel at TOP, LMB = inner/+X, RMB = outer/-X
         paw.target = {
           x: liveMouseX + 1.2 + lrBias * 6.4,
@@ -961,20 +1131,22 @@ export class KuroCatEngine {
           y: liveMouseY + 10.0 - anyClickPress * 3.4,
         };
       }
-      const stillHolding =
-        this.mouseLeftDown ||
-        this.mouseRightDown ||
-        this.mouseMiddleDown ||
-        now - this.lastMouseMoveAt < 2200;
+      const stillHolding = this.pointerDevice === 'trackpad'
+        ? (paw === this.keyboardPaw ? this.mouseRightPress >= 0.05 : this.isTrackpadActive(now))
+        : this.mouseLeftDown || this.mouseRightDown || this.mouseMiddleDown ||
+          now - this.lastMouseMoveAt < 2200;
       if (!stillHolding) {
         paw.mode = 'idle';
       }
     } else if (paw.mode === 'poke') {
       paw.pokeTime += dt;
       if (paw.pokeTime > 0.13) {
-        if (paw.side === 'left' && (this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 450)) {
+        const returnToPointer = this.pointerDevice === 'trackpad'
+          ? this.isTrackpadActive(now, 320)
+          : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 450;
+        if (paw === this.pointerPaw && returnToPointer) {
           paw.mode = 'mouse';
-        } else if (now - this.lastAnyKeyAt < 650) {
+        } else if (!this.isSolidBlackCat && now - this.lastAnyKeyAt < 650) {
           paw.mode = 'curled';
         } else {
           paw.mode = 'idle';
@@ -986,42 +1158,14 @@ export class KuroCatEngine {
       }
     }
 
+    const tucked = this.tuckedPawPosition(paw.side);
     if (paw.mode === 'curled') {
       paw.target = this.getLiveCurledPawPos(paw, 0);
     } else if (paw.mode === 'idle') {
-      const baseSp = this.spinePoint(1.0, 0);
-      paw.target = { x: baseSp.x + (paw.side === 'left' ? -19 : 19), y: baseSp.y };
+      paw.target = tucked;
     }
 
-    const wantIdle = paw.mode === 'idle' ? 1 : 0;
-    const wantCurl = paw.mode === 'curled' ? 1 : 0;
-    const blendRate = 1 - Math.exp(-20 * dt);
-    paw.idleWeight += (wantIdle - paw.idleWeight) * blendRate;
-    paw.curlWeight += (wantCurl - paw.curlWeight) * blendRate;
-
-    // Unconditionally stable, framerate-independent tracking (ZERO Euler spring overshoot at any FPS!)
-    const followRate = paw.mode === 'poke' ? 42 : paw.mode === 'mouse' ? 32 : 22;
-    const follow = 1 - Math.exp(-followRate * dt);
-    paw.pos.x += (paw.target.x - paw.pos.x) * follow;
-    paw.pos.y += (paw.target.y - paw.pos.y) * follow;
-    paw.vel.x = 0;
-    paw.vel.y = 0;
-
-    // Hard guarantee: while poking a key, paw tip stays strictly on top of the keyboard surface
-    if (paw.mode === 'poke') {
-      const clamped = this.clampToKeyboardSurface(paw.pos);
-      if (clamped.y < paw.pos.y || Math.abs(clamped.x - paw.pos.x) > 0.01) {
-        paw.pos.x = clamped.x;
-        paw.pos.y = Math.min(paw.pos.y, clamped.y);
-      }
-    }
-
-    paw.impactSquash = Math.max(0, paw.impactSquash - dt * 7.5);
-
-    for (const s of paw.smears) {
-      s.alpha -= dt * 3.8;
-    }
-    paw.smears = paw.smears.filter((s) => s.alpha > 0.02);
+    advancePaw(paw, tucked, dt);
   }
 
   // ---- High-fidelity true-scale rendering ----
@@ -1061,9 +1205,9 @@ export class KuroCatEngine {
 
     if (this.catBreed === 'dafeiyu') {
       const now = performance.now();
-      const layout = this.buildDaFeiYuLayout();
+      const layout = this.buildDaFeiYuLayout(now);
       this.dafeiyu.renderBody(ctx, now, layout);
-      this.drawMiniMouse(ctx);
+      this.drawPointerDevice(ctx);
       this.drawKeyboard(ctx);
       this.dafeiyu.renderForeground(ctx, this.lastDt, now, layout);
       if (this.showKeyBubbles && !this.privacyMode) {
@@ -1074,19 +1218,21 @@ export class KuroCatEngine {
       return;
     }
 
-    // Layer 1: Thick plush calm low-right S-hook black tail (measured 17px thick, barely drifts!)
-    this.drawTail(ctx);
-
-    // Layer 2: Mini mouse & 65% mechanical keyboard
-    this.drawMiniMouse(ctx);
+    if (!this.isSolidBlackCat) this.drawTail(ctx);
+    this.drawPointerDevice(ctx);
     this.drawKeyboard(ctx);
+    if (this.isSolidBlackCat) this.drawTail(ctx);
 
-    // Layer 3: Exact measured spine-deformable cat silhouette (ears, cheeks, neck, pear belly, grounded hind feet, eyes & tiny whiskers)
-    this.drawCatBody(ctx, breath, purrShift);
-
-    // Layer 4: True-scale velvety cat paws (tapered idle legs / planted diagonal mouse support leg / bent curled chest paw / plump round poking paw!)
-    this.drawPaw(ctx, this.leftPaw, breath);
-    this.drawPaw(ctx, this.rightPaw, breath);
+    if (this.isSolidBlackCat) {
+      // The solid dark limbs pass behind the torso as they retract.
+      this.drawPaw(ctx, this.leftPaw, breath);
+      this.drawPaw(ctx, this.rightPaw, breath);
+      this.drawCatBody(ctx, breath, purrShift);
+    } else {
+      this.drawCatBody(ctx, breath, purrShift);
+      this.drawPaw(ctx, this.leftPaw, breath);
+      this.drawPaw(ctx, this.rightPaw, breath);
+    }
 
     // Layer 5: Organic bouncing 3D keycap bubbles & crisp mouse click badges
     if (this.showKeyBubbles && !this.privacyMode) {
@@ -1095,6 +1241,12 @@ export class KuroCatEngine {
     }
 
     ctx.restore();
+  }
+
+  private tailRestTip(): Vec2 {
+    const hip = this.spinePoint(0.84, 0);
+    const drift = Math.sin(this.elapsed * 0.9) * 1.4;
+    return { x: hip.x + 126 + drift * 0.35, y: hip.y - 37 + drift };
   }
 
   private drawTail(ctx: CanvasRenderingContext2D): void {
@@ -1235,9 +1387,22 @@ export class KuroCatEngine {
       ctx.shadowBlur = 1.6;
       ctx.strokeStyle = '#141314';
       ctx.lineWidth = 16.0;
+      const tip = this.tailStrike.tip;
+      const reach = this.tailStrike.reach;
+      const tipX = tip?.x ?? endX;
+      const tipY = tip?.y ?? endY;
+      const sweep = tip ? Math.min(1, Math.abs(tipX - startX) / 160) : 0;
+      const bendX = tipX + Math.min(34, (this.logicalW - tipX) * 0.42);
+      const bendY = tipY - 49 - sweep * 19;
       ctx.beginPath();
       ctx.moveTo(startX, startY);
-      ctx.bezierCurveTo(cp1X, cp1Y, cp2X, cp2Y, endX, endY);
+      ctx.bezierCurveTo(
+        cp1X + (Math.min(this.logicalW - 14, startX + 67) - cp1X) * reach,
+        cp1Y - 29 * reach,
+        cp2X + (bendX - cp2X) * reach,
+        cp2Y + (bendY - cp2Y) * reach,
+        tipX, tipY,
+      );
       ctx.stroke();
     }
 
@@ -1305,28 +1470,7 @@ export class KuroCatEngine {
       ctx.shadowBlur = 1.6;
     }
 
-    // 1) Cute rounded grounded hind paws peeking out when front paws lift (matches 8.3s, 10.6s, 13.2s, 31.0s!)
-    const anyFrontLifted = this.leftPaw.idleWeight < 0.7 || this.rightPaw.idleWeight < 0.7;
-    if (anyFrontLifted) {
-      ctx.fillStyle = isRagdoll ? '#f7f5f0' : catBlack;
-      ctx.strokeStyle = inkOutline;
-      ctx.lineWidth = 1.9;
-      for (const [fx, fy, rx, ry] of [
-        [basePt.x - 42, basePt.y - 3, 14.5, 11.5],
-        [basePt.x + 32, basePt.y - 1, 15.0, 11.5],
-      ]) {
-        ctx.beginPath();
-        ctx.ellipse(fx, fy, rx, ry, 0, 0, Math.PI * 2);
-        ctx.fill();
-        if (isRagdoll) {
-          ctx.save();
-          ctx.shadowBlur = 0;
-          ctx.shadowOffsetY = 0;
-          ctx.stroke();
-          ctx.restore();
-        }
-      }
-    }
+    if (isRagdoll) this.drawHindPaws(ctx, basePt, '#f7f5f0', inkOutline);
 
     // 2) Build exact smooth spline through measured silhouette slices (left top -> right top -> right down -> bottom -> left up)!
     const traceBodyPath = () => {
@@ -1473,6 +1617,18 @@ export class KuroCatEngine {
     } else {
       ctx.fillStyle = catBlack;
       ctx.fill();
+
+      ctx.save();
+      ctx.clip();
+      ctx.shadowBlur = 0;
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        if (paw.restingLineOpacity < 0.012) continue;
+        ctx.save();
+        ctx.globalAlpha *= paw.restingLineOpacity;
+        this.drawIdlePaw(ctx, paw, breath);
+        ctx.restore();
+      }
+      ctx.restore();
     }
 
     // 3) Compact plush rounded cat ears matching ORIG 0.3s exact height (shorter & cuter, no tall rabbit ears!)
@@ -1735,10 +1891,246 @@ export class KuroCatEngine {
     }
   }
 
+  private drawPointerDevice(ctx: CanvasRenderingContext2D): void {
+    if (this.pointerDevice === 'trackpad') {
+      if (this.usesLowProfileDesk) this.drawLargeTrackpad(ctx);
+      else this.drawTrackpad(ctx);
+    } else {
+      this.drawMiniMouse(ctx);
+    }
+  }
+
+  private lowProfileKeyBounds() {
+    const rearInset = this.keyboardOrientation === 'viewer' ? DESK_KEYS_TOP_INSET : DESK_KEYS_BOTTOM_INSET;
+    return {
+      left: this.kbCenterX - this.kbWidth / 2 + DESK_KEYS_SIDE_INSET,
+      top: this.kbCenterY - this.kbHeight / 2 + rearInset,
+      unitWidth: (this.kbWidth - 2 * DESK_KEYS_SIDE_INSET) / LOW_PROFILE_LAYOUT.totalUnits,
+      rowHeight: (this.kbHeight - DESK_KEYS_TOP_INSET - DESK_KEYS_BOTTOM_INSET) / LOW_PROFILE_LAYOUT.totalRows,
+    };
+  }
+
+  private drawLowProfileKeyboard(ctx: CanvasRenderingContext2D): void {
+    const { totalUnits, totalRows, keys } = LOW_PROFILE_LAYOUT;
+    const viewer = this.keyboardOrientation === 'viewer';
+    const left = this.kbCenterX - this.kbWidth / 2;
+    const top = this.kbCenterY - this.kbHeight / 2;
+    const lift = 3.3 - this.kbBounce * 0.8;
+    const center = this.logicalW / 2;
+    const bounds = this.lowProfileKeyBounds();
+
+    ctx.save();
+    ctx.save();
+    ctx.shadowColor = 'rgba(9, 16, 28, 0.26)';
+    ctx.shadowBlur = 7;
+    ctx.shadowOffsetY = 3.2;
+    ctx.fillStyle = '#7c8490';
+    traceDeskRect(ctx, center, left, top, this.kbWidth, this.kbHeight, 5);
+    ctx.fill();
+    ctx.restore();
+
+    const frame = ctx.createLinearGradient(0, top, 0, top + this.kbHeight);
+    frame.addColorStop(0, '#f3f5f6');
+    frame.addColorStop(0.48, '#b9c3cc');
+    frame.addColorStop(1, '#dce0e4');
+    ctx.fillStyle = frame;
+    traceDeskRect(ctx, center, left, top, this.kbWidth, this.kbHeight, 5, lift);
+    ctx.fill();
+    ctx.strokeStyle = '#6d7581';
+    ctx.lineWidth = 0.85;
+    ctx.stroke();
+
+    ctx.fillStyle = '#515b65';
+    traceDeskRect(ctx, center, left + 2.4, top + 2, this.kbWidth - 4.8, this.kbHeight - 4, 3.5, lift);
+    ctx.fill();
+
+    const stripY = viewer ? top + 2.8 : top + this.kbHeight - 11;
+    ctx.fillStyle = '#353c46';
+    traceDeskRect(ctx, center, left + 4, stripY, this.kbWidth - 8, 8.2, 2.8, lift);
+    ctx.fill();
+    const stripCenter = this.projectDesk(this.kbCenterX, stripY + 4.3);
+    const stripLight = ctx.createLinearGradient(
+      stripCenter.x - this.kbWidth * 0.45, 0, stripCenter.x + this.kbWidth * 0.45, 0,
+    );
+    stripLight.addColorStop(0, '#a7e171');
+    stripLight.addColorStop(0.52, '#72e4b9');
+    stripLight.addColorStop(1, '#8ed8ff');
+    ctx.globalAlpha = 0.72;
+    ctx.fillStyle = stripLight;
+    traceDeskRect(ctx, center, left + 7, stripY + 6.9, this.kbWidth - 14, 0.65, 0.3, lift);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.save();
+    ctx.translate(stripCenter.x, stripCenter.y - lift);
+    if (!viewer) ctx.rotate(Math.PI);
+    ctx.fillStyle = stripLight;
+    ctx.font = '700 5.4px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('R E P U B L I C   O F   G A M E R S', 0, -0.45);
+    ctx.restore();
+
+    const gap = 0.95;
+    for (const key of keys) {
+      const col = viewer ? key.uStart : totalUnits - key.uStart - key.uWidth;
+      const row = viewer ? key.row : totalRows - 1 - key.row;
+      const x = bounds.left + col * bounds.unitWidth + gap / 2;
+      const y = bounds.top + row * bounds.rowHeight + gap / 2;
+      const w = key.uWidth * bounds.unitWidth - gap;
+      const h = bounds.rowHeight - gap;
+      const press = this.keyAnims.get(key.id)?.pressAmount ?? 0;
+      const keyLift = lift + 1.65 - press * 1.35;
+      const lit = press > 0.14;
+      const hue = 74 + (key.uStart / (totalUnits - 1)) * 108;
+
+      ctx.fillStyle = lit ? '#819469' : '#aebac7';
+      traceDeskRect(ctx, center, x - 0.2, y, w + 0.4, h, 1.6, lift);
+      ctx.fill();
+      ctx.fillStyle = lit ? 'hsl(83 79% 77%)' : `hsl(${hue} 30% 96%)`;
+      traceDeskRect(ctx, center, x + 0.25, y + 0.15, w - 0.5, h - 0.8, 1.55, keyLift);
+      ctx.fill();
+
+      const label = key.id === 'space' ? '━' : key.id === 'esc' ? 'Esc' : key.label;
+      const labelPoint = this.projectDesk(x + w / 2, y + h * 0.51);
+      ctx.save();
+      ctx.translate(labelPoint.x, labelPoint.y - keyLift);
+      if (!viewer) ctx.rotate(Math.PI);
+      ctx.fillStyle = lit ? '#252d19' : `hsl(${hue} 62% 27%)`;
+      ctx.font = `700 ${label.length >= 3 ? 4.65 : 6.25}px system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, 0, 0);
+      ctx.restore();
+    }
+
+    if (this.privacyClose > 0.08) {
+      ctx.globalAlpha = this.privacyClose;
+      ctx.fillStyle = 'rgba(15, 20, 32, 0.86)';
+      traceDeskRect(ctx, center, left + 2, top + 2, this.kbWidth - 4, this.kbHeight - 4, 4.5, lift + 1.7);
+      ctx.fill();
+      ctx.fillStyle = '#fbcfe8';
+      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🔒 密码输入中 · 已隐藏按键', this.kbCenterX, this.kbCenterY);
+    }
+    ctx.restore();
+  }
+
+  private drawLargeTrackpad(ctx: CanvasRenderingContext2D): void {
+    const left = this.mouseBaseX - DESK_TRACKPAD_WIDTH / 2;
+    const top = this.mouseBaseY - DESK_TRACKPAD_DEPTH / 2;
+    const center = this.logicalW / 2;
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const lift = 2.25 - press * 0.65;
+    ctx.save();
+    ctx.save();
+    ctx.shadowColor = 'rgba(9, 16, 28, 0.27)';
+    ctx.shadowBlur = 7;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = '#8895a1';
+    traceDeskRect(ctx, center, left, top, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH, 8);
+    ctx.fill();
+    ctx.restore();
+
+    const surface = ctx.createLinearGradient(0, top, 0, top + DESK_TRACKPAD_DEPTH);
+    surface.addColorStop(0, '#f8fbff');
+    surface.addColorStop(0.58, '#edf2f8');
+    surface.addColorStop(1, '#dfe6ee');
+    ctx.fillStyle = surface;
+    ctx.strokeStyle = '#84919e';
+    ctx.lineWidth = 0.9;
+    traceDeskRect(ctx, center, left, top, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH, 8, lift);
+    ctx.fill();
+    this.fillTrackpadClick(ctx);
+    ctx.stroke();
+    ctx.clip();
+
+    const origin = this.projectDesk(this.mouseBaseX, this.mouseBaseY);
+    const contact = this.getTrackpadContactWorld();
+    ctx.translate(origin.x, origin.y - lift);
+    this.drawTrackpadContacts(ctx, { x: contact.x - origin.x, y: contact.y - origin.y });
+    ctx.restore();
+  }
+
+  private drawTrackpad(ctx: CanvasRenderingContext2D): void {
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const contact = this.getTrackpadContact();
+    ctx.save();
+    ctx.translate(this.mouseBaseX, this.mouseBaseY);
+    ctx.rotate(this.kbTiltRad);
+    const viewerFacing = this.keyboardOrientation === 'viewer';
+    ctx.transform(1, 0, viewerFacing ? 0 : -0.10, 0.84, 0, 0);
+    const traceSurface = (top: number, bottom: number) => {
+      if (viewerFacing) {
+        this.trapezoidPath(ctx, TRACKPAD_REAR_HALF_WIDTH, TRACKPAD_FRONT_HALF_WIDTH, top, bottom, 6);
+      } else {
+        this.roundRect(ctx, -26, top, 52, bottom - top, 6);
+      }
+    };
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.30)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = '#9298a0';
+    traceSurface(-18, 21);
+    ctx.fill();
+    ctx.restore();
+
+    const surface = ctx.createLinearGradient(0, -21, 0, 21);
+    surface.addColorStop(0, '#f0f2f4');
+    surface.addColorStop(1, '#d2d6da');
+    ctx.fillStyle = surface;
+    ctx.strokeStyle = '#727b85';
+    ctx.lineWidth = 1.2;
+    traceSurface(-20 + press * 1.5, 18 + press * 1.5);
+    ctx.fill();
+    this.fillTrackpadClick(ctx);
+    ctx.stroke();
+    ctx.clip();
+    this.drawTrackpadContacts(ctx, contact);
+    ctx.restore();
+  }
+
+  private fillTrackpadClick(ctx: CanvasRenderingContext2D): void {
+    const right = this.mouseRightDown || (!this.mouseLeftDown && this.mouseRightPress > this.mouseLeftPress);
+    const press = right ? this.mouseRightPress : this.mouseLeftPress;
+    if (press <= 0.01) return;
+
+    ctx.save();
+    ctx.globalAlpha *= press;
+    ctx.fillStyle = right ? TRACKPAD_RIGHT_COLOR : TRACKPAD_LEFT_COLOR;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  private drawTrackpadContacts(ctx: CanvasRenderingContext2D, contact: Vec2): void {
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const moving = Math.max(0, 1 - (performance.now() - this.lastMouseMoveAt) / TRACKPAD_GLIDE_IDLE_MS);
+    const drawContact = (offset: number, intensity: number, color: string) => {
+      if (intensity <= 0.02) return;
+      ctx.globalAlpha = intensity;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.ellipse(contact.x + offset, contact.y, 4.6 + press * 2, 4.6 + press * 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    };
+    const colors = this.getMouseButtonColors();
+    if (this.mouseRightPress > 0.05 || this.mouseScrollFlash > 0.05) {
+      const intensity = Math.max(this.mouseRightPress, this.mouseScrollFlash) * 0.82;
+      const color = this.mouseRightPress > this.mouseScrollFlash ? colors.right : colors.middle;
+      drawContact(-6, intensity, color);
+      drawContact(6, intensity, color);
+    } else {
+      drawContact(0, Math.max(press * 0.82, moving * 0.33), colors.left);
+    }
+  }
+
   private drawMiniMouse(ctx: CanvasRenderingContext2D): void {
     const mx = this.mouseBaseX + this.mouseOffsetX;
     const my = this.mouseBaseY + this.mouseOffsetY;
-    const rx = 18.5;
+    const rx = MOUSE_HALF_WIDTH;
     const ry = 23.0;
     const lPress = this.mouseLeftPress;
     const rPress = this.mouseRightPress;
@@ -1747,7 +2139,7 @@ export class KuroCatEngine {
 
     ctx.save();
     ctx.translate(mx, my);
-    ctx.rotate(-0.06);
+    ctx.rotate(this.keyboardOrientation === 'viewer' ? this.kbTiltRad : -0.06);
 
     // Soft 3D base rim / drop shadow
     ctx.save();
@@ -1877,7 +2269,12 @@ export class KuroCatEngine {
   }
 
   private drawKeyboard(ctx: CanvasRenderingContext2D): void {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    if (this.usesLowProfileDesk) {
+      this.drawLowProfileKeyboard(ctx);
+      return;
+    }
+
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const is108 = this.keyboardLayout === '108';
     const padX = 7;
@@ -2032,383 +2429,198 @@ export class KuroCatEngine {
   /**
    * True-scale plush velvety cat arm & chubby rounded paw ball (1:1 match to reference photo & 8.3s / 13.2s / 31.0s!)
    */
-  private drawPlumpCatArm(
-    ctx: CanvasRenderingContext2D,
-    side: 'left' | 'right',
-    sx: number,
-    sy: number,
-    px: number,
-    py: number,
-    squash: number,
-    withCrease: boolean,
-  ): void {
-    const dx = px - sx;
-    const dy = py - sy;
-    const len = Math.max(1, Math.hypot(dx, dy));
-    const ux = dx / len;
-    const uy = dy / len;
+  private drawForeleg(ctx: CanvasRenderingContext2D, paw: PawState, breath: number): void {
+    const shoulder = this.getLiveShoulder(paw, breath);
+    const { x, y } = paw.pos;
+    const dx = x - shoulder.x;
+    const dy = y - shoulder.y;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const ux = dx / length;
+    const uy = dy / length;
     const nx = -uy;
     const ny = ux;
+    const side = paw.side === 'left' ? -1 : 1;
+    const elbowX = shoulder.x + dx * 0.47 + side * 10 * paw.curl;
+    const elbowY = shoulder.y + dy * 0.47 + 13 * paw.curl;
+    const shoulderRadius = 14;
+    const pawWidth = 12.7 + 2.6 * paw.squash;
+    const cap = 15.5 - 2.8 * paw.squash;
+    const silhouette = new Path2D();
+    silhouette.moveTo(shoulder.x + nx * shoulderRadius, shoulder.y + ny * shoulderRadius);
+    silhouette.quadraticCurveTo(elbowX + nx * 11, elbowY + ny * 11, x + nx * pawWidth, y + ny * pawWidth);
+    silhouette.bezierCurveTo(
+      x + nx * pawWidth + ux * cap, y + ny * pawWidth + uy * cap,
+      x - nx * pawWidth + ux * cap, y - ny * pawWidth + uy * cap,
+      x - nx * pawWidth, y - ny * pawWidth,
+    );
+    silhouette.quadraticCurveTo(elbowX - nx * 11, elbowY - ny * 11,
+      shoulder.x - nx * shoulderRadius, shoulder.y - ny * shoulderRadius);
+    silhouette.quadraticCurveTo(shoulder.x - ux * shoulderRadius, shoulder.y - uy * shoulderRadius,
+      shoulder.x + nx * shoulderRadius, shoulder.y + ny * shoulderRadius);
+    silhouette.closePath();
 
-    const wristDist = Math.max(6, len - 8);
-    const wx = sx + ux * wristDist;
-    const wy = sy + uy * wristDist;
+    const skin = this.customSkin;
+    const ragdoll = this.catBreed === 'ragdoll';
+    const armColor = skin?.armColor ?? (ragdoll ? '#f5f1e8' : '#141314');
+    const pawColor = skin?.pawColor ?? (ragdoll ? '#fcfaf4' : armColor);
+    const edge = skin ? (skin.pawOutlineColor || skin.outlineColor) : ragdoll ? '#66574f' : null;
 
-    // True-scale plush proportions for 248px tall cat!
-    const rShoulder = 14.2;
-    const rWrist = 9.4;
-    const pawRx = 14.5 * (1 + squash * 0.14);
-    const pawRy = 11.8 * (1 - squash * 0.12);
-
-    if (this.customSkin) {
-      this.drawCustomPlumpArm(ctx, this.customSkin, side, sx, sy, px, py, squash, withCrease);
+    if (this.isSolidBlackCat) {
+      ctx.fillStyle = armColor;
+      ctx.fill(silhouette);
       return;
     }
 
-    const isRagdoll = this.catBreed === 'ragdoll';
     ctx.save();
+    ctx.globalAlpha *= paw.exposure;
+    ctx.fillStyle = armColor;
+    if (armColor !== pawColor) {
+      const fur = ctx.createLinearGradient(shoulder.x, shoulder.y, x, y);
+      fur.addColorStop(0, armColor);
+      fur.addColorStop(0.71, armColor);
+      fur.addColorStop(0.97, pawColor);
+      ctx.fillStyle = fur;
+    }
+    ctx.fill(silhouette);
 
-    if (isRagdoll) {
-      // Seamless pure creamy snow-white Ragdoll mitten arm melting smoothly out of the white chest!
-      const armGrad = ctx.createLinearGradient(sx, sy, px, py);
-      armGrad.addColorStop(0.0, '#f5f1e8');
-      armGrad.addColorStop(0.5, '#f9f6ef');
-      armGrad.addColorStop(1.0, '#fcfaf4');
-
-      ctx.fillStyle = armGrad;
-
-      // Tapered snow-white arm silhouette (NO dark shadow smudge over the white chest!)
-      const traceArmPath = () => {
-        ctx.beginPath();
-        ctx.moveTo(sx + nx * rShoulder, sy + ny * rShoulder);
-        ctx.quadraticCurveTo(
-          (sx + wx) * 0.5 + nx * (rShoulder * 0.84),
-          (sy + wy) * 0.5 + ny * (rShoulder * 0.84),
-          wx + nx * rWrist,
-          wy + ny * rWrist,
-        );
-        ctx.lineTo(wx - nx * rWrist, wy - ny * rWrist);
-        ctx.quadraticCurveTo(
-          (sx + wx) * 0.5 - nx * (rShoulder * 0.84),
-          (sy + wy) * 0.5 - ny * (rShoulder * 0.84),
-          sx - nx * rShoulder,
-          sy - ny * rShoulder,
-        );
-        ctx.closePath();
-      };
-      traceArmPath();
-      ctx.fill();
-
-      // Seamless white shoulder merge (invisible against white chest — ZERO grey shoulder blob!)
-      ctx.beginPath();
-      ctx.arc(sx, sy, rShoulder, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Signature unique marking from user's real Ragdoll photo: adorable warm taupe-brown oval patch on viewer's RIGHT front forearm!
-      if (side === 'right' && len > 26) {
+    if (skin || (ragdoll && paw.side === 'right')) {
+      ctx.save();
+      ctx.clip(silhouette);
+      const armPart = paw.side === 'left' ? 'leftArm' : 'rightArm';
+      for (const spot of skin?.spots ?? []) {
+        if (spot.part !== armPart) continue;
+        const along = Math.max(0.1, Math.min(0.9, spot.x));
         ctx.save();
-        traceArmPath();
-        ctx.clip();
-        const spotX = sx + ux * (len * 0.64) + nx * 2.0;
-        const spotY = sy + uy * (len * 0.64) + ny * 2.0;
-        const armAngle = Math.atan2(dy, dx);
-        ctx.fillStyle = 'rgba(134, 118, 102, 0.84)';
-        ctx.shadowColor = 'rgba(134, 118, 102, 0.45)';
-        ctx.shadowBlur = 2.5;
+        ctx.globalAlpha *= spot.opacity ?? 0.85;
+        ctx.fillStyle = spot.color;
         ctx.beginPath();
-        ctx.ellipse(spotX, spotY, Math.min(13.5, len * 0.16), 8.2, armAngle, 0, Math.PI * 2);
+        ctx.ellipse(
+          shoulder.x + dx * along + nx * spot.y, shoulder.y + dy * along + ny * spot.y,
+          Math.max(2, spot.rx), Math.max(2, spot.ry), Math.atan2(dy, dx) + (spot.rotation ?? 0),
+          0, Math.PI * 2,
+        );
         ctx.fill();
         ctx.restore();
       }
-
-      // Soft subtle contact shadow ONLY under the plump round white mitten paw ball
-      ctx.save();
-      ctx.shadowColor = 'rgba(46, 38, 30, 0.22)';
-      ctx.shadowBlur = 4;
-      ctx.shadowOffsetY = 1.5;
-      ctx.fillStyle = '#fcfaf4';
-      ctx.beginPath();
-      ctx.ellipse(px, py, pawRx, pawRy, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-
-      // Refined warm-taupe arm side strokes that fade gently out at the shoulder and stay crisp along forearm & paw!
-      ctx.lineWidth = 1.65;
-      ctx.lineCap = 'round';
-      for (const sgn of [-1, 1]) {
-        const startFrac = withCrease ? 0.16 : 0.08;
-        const esx = sx + ux * (len * startFrac) + nx * sgn * (rShoulder * (1 - startFrac * 0.16));
-        const esy = sy + uy * (len * startFrac) + ny * sgn * (rShoulder * (1 - startFrac * 0.16));
-        const eex = wx + nx * sgn * rWrist;
-        const eey = wy + ny * sgn * rWrist;
-
-        const edgeGrad = ctx.createLinearGradient(esx, esy, eex, eey);
-        edgeGrad.addColorStop(0.0, 'rgba(93, 81, 72, 0.0)');
-        edgeGrad.addColorStop(0.24, 'rgba(93, 81, 72, 0.78)');
-        edgeGrad.addColorStop(1.0, 'rgba(93, 81, 72, 0.92)');
-
-        ctx.strokeStyle = edgeGrad;
+      if (ragdoll && paw.side === 'right') {
+        ctx.fillStyle = 'rgba(134, 118, 102, 0.68)';
         ctx.beginPath();
-        ctx.moveTo(esx, esy);
-        ctx.quadraticCurveTo(
-          (sx + wx) * 0.5 + nx * sgn * (rShoulder * 0.84),
-          (sy + wy) * 0.5 + ny * sgn * (rShoulder * 0.84),
-          eex,
-          eey,
-        );
-        ctx.stroke();
+        ctx.ellipse(shoulder.x + dx * 0.61, shoulder.y + dy * 0.61,
+          Math.min(13, length * 0.16), 8, Math.atan2(dy, dx), 0, Math.PI * 2);
+        ctx.fill();
       }
-
-      // Crisp rounded mitten paw outline arc so the white paw reads clearly against white keyboard keys!
-      const pawAng = Math.atan2(dy, dx);
-      ctx.strokeStyle = 'rgba(93, 81, 72, 0.92)';
-      ctx.beginPath();
-      ctx.ellipse(px, py, pawRx, pawRy, 0, pawAng - Math.PI * 0.62, pawAng + Math.PI * 0.62);
-      ctx.stroke();
-
       ctx.restore();
-      return;
     }
 
-    ctx.shadowColor = 'rgba(18, 17, 18, 0.42)';
-    ctx.shadowBlur = 1.6;
-    ctx.fillStyle = '#141314';
-
-    // Arm silhouette tapering gently from shoulder to wrist
-    ctx.beginPath();
-    ctx.moveTo(sx + nx * rShoulder, sy + ny * rShoulder);
-    ctx.quadraticCurveTo(
-      (sx + wx) * 0.5 + nx * (rShoulder * 0.84),
-      (sy + wy) * 0.5 + ny * (rShoulder * 0.84),
-      wx + nx * rWrist,
-      wy + ny * rWrist,
-    );
-    ctx.lineTo(wx - nx * rWrist, wy - ny * rWrist);
-    ctx.quadraticCurveTo(
-      (sx + wx) * 0.5 - nx * (rShoulder * 0.84),
-      (sy + wy) * 0.5 - ny * (rShoulder * 0.84),
-      sx - nx * rShoulder,
-      sy - ny * rShoulder,
-    );
-    ctx.closePath();
-    ctx.fill();
-
-    // Seamless shoulder merge
-    ctx.beginPath();
-    ctx.arc(sx, sy, rShoulder, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Plump, soft rounded black velvet paw ball pressing firmly onto the key!
-    ctx.beginPath();
-    ctx.ellipse(px, py, pawRx, pawRy, 0, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.shadowBlur = 0;
-
-    // Clean crisp subtle light-grey side separation lines ONLY where the arm crosses the black body (exact 2.2s / 8.3s / 13.2s!)
-    if (withCrease && len > 28) {
-      const startFrac = 0.18;
-      const endFrac = 0.72;
-      for (const sgn of [-1, 1]) {
-        const csx = sx + ux * (len * startFrac) + nx * sgn * (rShoulder * 0.86);
-        const csy = sy + uy * (len * startFrac) + ny * sgn * (rShoulder * 0.86);
-        const cex = sx + ux * (len * endFrac) + nx * sgn * (rWrist * 1.02);
-        const cey = sy + uy * (len * endFrac) + ny * sgn * (rWrist * 1.02);
-
-        const creaseGrad = ctx.createLinearGradient(csx, csy, cex, cey);
-        creaseGrad.addColorStop(0.0, 'rgba(216, 218, 222, 0.0)');
-        creaseGrad.addColorStop(0.22, 'rgba(216, 218, 222, 0.65)');
-        creaseGrad.addColorStop(0.84, 'rgba(216, 218, 222, 0.56)');
-        creaseGrad.addColorStop(1.0, 'rgba(216, 218, 222, 0.0)');
-
-        ctx.strokeStyle = creaseGrad;
-        ctx.lineWidth = 1.3;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(csx, csy);
-        ctx.lineTo(cex, cey);
-        ctx.stroke();
-      }
-    }
-
+    const crease = skin?.armCreaseColor ?? '#b9bbc1';
+    const rim = ctx.createLinearGradient(shoulder.x, shoulder.y, x, y);
+    rim.addColorStop(0, 'transparent');
+    rim.addColorStop(0.38, 'transparent');
+    rim.addColorStop(0.78, edge ?? crease);
+    rim.addColorStop(1, edge ?? crease);
+    ctx.strokeStyle = rim;
+    ctx.lineWidth = ragdoll ? 1.3 : 1.1;
+    ctx.globalAlpha *= edge ? 0.66 : paw.crease * 0.34;
+    ctx.stroke(silhouette);
     ctx.restore();
   }
 
-  /**
-   * Real 2-segment articulated bent kitten arm (shoulder -> elbow -> curled plump paw on chest!)
-   * Matches original video 8.3s (left paw), 10.6s (both paws), 23.2s, 26.2s!
-   */
-  private drawBentCurledArm(ctx: CanvasRenderingContext2D, paw: PawState, breath: number, alpha: number): void {
-    const sh = this.getLiveShoulder(paw, breath);
-    const cp = this.getLiveCurledPawPos(paw, breath);
-    const sign = paw.side === 'left' ? -1 : 1;
-    // Natural elbow bends slightly outward & down below shoulder before forearm curves inward-up!
-    const elbowX = sh.x + sign * 8;
-    const elbowY = cp.y + 8;
+  private drawHindPaws(
+    ctx: CanvasRenderingContext2D, base: Vec2, color: string, outline?: string | null,
+  ): void {
+    const t = Math.max(0, Math.min(1, (this.hindPawLift - 0.06) / 0.82));
+    const reveal = t * t * (3 - 2 * t);
+    if (reveal < 0.005) return;
 
-    if (this.customSkin) {
-      this.drawCustomBentArm(ctx, this.customSkin, paw, breath, alpha);
-      return;
-    }
-
-    const isRagdoll = this.catBreed === 'ragdoll';
+    const tuck = (1 - reveal) * 8;
     ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-
-    // Continuous bent velvety arm + plump curled paw
-    ctx.strokeStyle = isRagdoll ? '#f6f2ea' : '#141314';
-    ctx.lineWidth = 20;
-    ctx.beginPath();
-    ctx.moveTo(sh.x, sh.y);
-    ctx.quadraticCurveTo(elbowX, elbowY, cp.x, cp.y);
-    ctx.stroke();
-
-    // Signature warm taupe-brown patch on viewer's RIGHT curled forearm too!
-    if (isRagdoll && paw.side === 'right') {
-      ctx.save();
-      ctx.fillStyle = 'rgba(134, 118, 102, 0.78)';
+    ctx.globalAlpha *= reveal;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.9;
+    if (outline) ctx.strokeStyle = outline;
+    for (const [x, y, width] of [[-42, -3, 14.5], [32, -1, 15]]) {
       ctx.beginPath();
-      ctx.ellipse((elbowX + cp.x) * 0.5 + 2, (elbowY + cp.y) * 0.5 + 1, 7.5, 5.2, -0.35, 0, Math.PI * 2);
+      ctx.ellipse(base.x + x, base.y + y - tuck, width, 11.5, 0, 0, Math.PI * 2);
       ctx.fill();
-      ctx.restore();
+      if (outline) {
+        ctx.save();
+        ctx.shadowBlur = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.stroke();
+        ctx.restore();
+      }
     }
-
-    ctx.fillStyle = isRagdoll ? '#fcfaf4' : '#141314';
-    ctx.beginPath();
-    ctx.ellipse(cp.x, cp.y, 12.5, 11.0, sign * 0.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Clear crisp contour along the bent curled forearm & kitten paw
-    const grad = ctx.createLinearGradient(elbowX, elbowY - 12, cp.x, cp.y + 12);
-    if (isRagdoll) {
-      grad.addColorStop(0.0, 'rgba(93, 81, 72, 0.0)');
-      grad.addColorStop(0.28, 'rgba(93, 81, 72, 0.68)');
-      grad.addColorStop(0.86, 'rgba(93, 81, 72, 0.78)');
-      grad.addColorStop(1.0, 'rgba(93, 81, 72, 0.35)');
-    } else {
-      grad.addColorStop(0.0, 'rgba(214, 216, 220, 0.0)');
-      grad.addColorStop(0.30, 'rgba(214, 216, 220, 0.65)');
-      grad.addColorStop(0.85, 'rgba(220, 222, 226, 0.72)');
-      grad.addColorStop(1.0, 'rgba(220, 222, 226, 0.25)');
-    }
-
-    ctx.strokeStyle = grad;
-    ctx.lineWidth = isRagdoll ? 1.65 : 1.4;
-    ctx.beginPath();
-    ctx.moveTo(elbowX + sign * 8, elbowY - 16);
-    ctx.quadraticCurveTo(elbowX + sign * 4, elbowY + 12, cp.x + sign * 2, cp.y + 10);
-    ctx.quadraticCurveTo(cp.x - sign * 11, cp.y + 8, cp.x - sign * 12, cp.y - 4);
-    ctx.stroke();
-
     ctx.restore();
   }
 
   private drawPaw(ctx: CanvasRenderingContext2D, paw: PawState, breath: number): void {
-    // 1) Seated idle vertical front legs (EXACT 4 clean lines of ORIG 0.3s!) OR planted diagonal supporting leg (ORIG 2.2s!)
-    if (paw.idleWeight > 0.05) {
+    if (!this.isSolidBlackCat && paw.exposure < 1) {
       ctx.save();
-      ctx.globalAlpha = paw.idleWeight;
+      ctx.globalAlpha *= 1 - paw.exposure;
+      this.drawIdlePaw(ctx, paw, breath);
+      ctx.restore();
+    }
+    if (paw.exposure > 0) this.drawForeleg(ctx, paw, breath);
+  }
 
-      if (paw.side === 'right' && this.leftPaw.mode === 'mouse') {
-        const sh = this.getLiveShoulder(paw, breath);
-        const baseSp = this.spinePoint(1.0, breath);
-        this.drawPlumpCatArm(ctx, 'right', sh.x - 4, sh.y + 8, baseSp.x + 28, baseSp.y - 2, 0, true);
-      } else {
-        // Exact 4-line seated leg silhouette from ORIG 0.3s (outer curved leg line + crisp inner center-gap line!)
-        const topSp = this.spinePoint(0.66, breath);
-        const midSp = this.spinePoint(0.84, breath);
-        const botSp = this.spinePoint(1.0, breath);
-        const sign = paw.side === 'left' ? -1 : 1;
+  private drawIdlePaw(ctx: CanvasRenderingContext2D, paw: PawState, breath: number): void {
+    const topSp = this.spinePoint(0.66, breath);
+    const midSp = this.spinePoint(0.84, breath);
+    const botSp = this.spinePoint(1.0, breath);
+    const sign = paw.side === 'left' ? -1 : 1;
 
-        const outerTopX = topSp.x + sign * 41;
-        const outerBotX = botSp.x + sign * 35;
-        const innerTopX = topSp.x + sign * 6.5;
-        const innerBotX = botSp.x + sign * 9.5;
+    const outerTopX = topSp.x + sign * 41;
+    const outerBotX = botSp.x + sign * 35;
+    const innerTopX = topSp.x + sign * 6.5;
+    const innerBotX = botSp.x + sign * 9.5;
 
-        if (this.customSkin) {
-          this.drawCustomIdleLegDetails(ctx, this.customSkin, paw, topSp, midSp, botSp, sign, outerTopX, outerBotX, innerTopX, innerBotX);
-          ctx.restore();
-          return;
-        }
+    if (this.customSkin) {
+      this.drawCustomIdleLegDetails(ctx, this.customSkin, paw, topSp, midSp, botSp, sign, outerTopX, outerBotX, innerTopX, innerBotX);
+      return;
+    }
 
-        // Signature warm taupe-brown oval leg patch on viewer's RIGHT seated front leg (1:1 match to user's real Ragdoll!)
-        const isRagdoll = this.catBreed === 'ragdoll';
-        if (isRagdoll && paw.side === 'right') {
-          ctx.save();
-          ctx.fillStyle = 'rgba(134, 118, 102, 0.80)';
-          ctx.shadowColor = 'rgba(134, 118, 102, 0.40)';
-          ctx.shadowBlur = 3.0;
-          ctx.beginPath();
-          ctx.ellipse(midSp.x + 21, midSp.y + 12, 9.5, 13.5, 0.22, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.restore();
-        }
-
-        // Crisp subtle outer leg curve & inner leg-gap line (4 total lines across both legs — exact ORIG 0.3s!)
-        const lineGrad = ctx.createLinearGradient(topSp.x, topSp.y, botSp.x, botSp.y);
-        if (isRagdoll) {
-          lineGrad.addColorStop(0.0, 'rgba(93, 81, 72, 0.0)');
-          lineGrad.addColorStop(0.18, 'rgba(93, 81, 72, 0.62)');
-          lineGrad.addColorStop(0.92, 'rgba(93, 81, 72, 0.68)');
-          lineGrad.addColorStop(1.0, 'rgba(93, 81, 72, 0.28)');
-        } else {
-          lineGrad.addColorStop(0.0, 'rgba(210, 212, 216, 0.0)');
-          lineGrad.addColorStop(0.18, 'rgba(210, 212, 216, 0.64)');
-          lineGrad.addColorStop(0.92, 'rgba(210, 212, 216, 0.62)');
-          lineGrad.addColorStop(1.0, 'rgba(210, 212, 216, 0.25)');
-        }
-
-        ctx.strokeStyle = lineGrad;
-        ctx.lineWidth = isRagdoll ? 1.55 : 1.4;
-        ctx.lineCap = 'round';
-
-        // Outer front-leg separation line (gently curves inward toward paw!)
-        ctx.beginPath();
-        ctx.moveTo(outerTopX, topSp.y);
-        ctx.quadraticCurveTo(midSp.x + sign * 41, midSp.y, outerBotX, botSp.y - 1);
-        ctx.stroke();
-
-        // Inner front-leg gap line (tapers slightly outward toward paws, exact inverted narrow V from ORIG 0.3s!)
-        ctx.beginPath();
-        ctx.moveTo(innerTopX, topSp.y + 10);
-        ctx.lineTo(innerBotX, botSp.y - 1);
-        ctx.stroke();
-      }
+    // Signature warm taupe-brown oval leg patch on viewer's RIGHT seated front leg (1:1 match to user's real Ragdoll!)
+    const ragdoll = this.catBreed === 'ragdoll';
+    if (ragdoll && paw.side === 'right') {
+      ctx.save();
+      ctx.fillStyle = 'rgba(134, 118, 102, 0.80)';
+      ctx.shadowColor = 'rgba(134, 118, 102, 0.40)';
+      ctx.shadowBlur = 3.0;
+      ctx.beginPath();
+      ctx.ellipse(midSp.x + 21, midSp.y + 12, 9.5, 13.5, 0.22, 0, Math.PI * 2);
+      ctx.fill();
       ctx.restore();
     }
 
-    // 2) Continuous bent articulated curled chest arm (8.3s / 10.6s / 23.2s / 26.2s!)
-    if (paw.curlWeight > 0.05) {
-      this.drawBentCurledArm(ctx, paw, breath, paw.curlWeight);
+    // Crisp subtle outer leg curve & inner leg-gap line (4 total lines across both legs — exact ORIG 0.3s!)
+    const lineGrad = ctx.createLinearGradient(topSp.x, topSp.y, botSp.x, botSp.y);
+    if (ragdoll) {
+      lineGrad.addColorStop(0.0, 'rgba(93, 81, 72, 0)');
+      lineGrad.addColorStop(0.18, 'rgba(93, 81, 72, 0.62)');
+      lineGrad.addColorStop(0.92, 'rgba(93, 81, 72, 0.68)');
+      lineGrad.addColorStop(1.0, 'rgba(93, 81, 72, 0.28)');
+    } else {
+      lineGrad.addColorStop(0.0, 'rgba(78, 77, 84, 0)');
+      lineGrad.addColorStop(0.25, 'rgba(78, 77, 84, 0.82)');
+      lineGrad.addColorStop(0.85, 'rgba(78, 77, 84, 0.76)');
+      lineGrad.addColorStop(1.0, 'rgba(78, 77, 84, 0.36)');
     }
 
-    // 3) Plump velvety poking / mouse-holding cat arm!
-    const activeArmWeight = Math.max(0, 1 - paw.idleWeight - paw.curlWeight);
-    if (activeArmWeight > 0.05) {
-      const sh = this.getLiveShoulder(paw, breath);
-      const px = paw.pos.x;
-      const mouseClickDrop =
-        paw.mode === 'mouse'
-          ? Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress) * 1.8
-          : 0;
-      const py = paw.pos.y + mouseClickDrop;
+    ctx.strokeStyle = lineGrad;
+    ctx.lineWidth = ragdoll ? 1.55 : 1.4;
+    ctx.lineCap = 'round';
 
-      ctx.save();
-      ctx.globalAlpha = Math.min(1, activeArmWeight * 1.2);
+    // Outer front-leg separation line (gently curves inward toward paw!)
+    ctx.beginPath();
+    ctx.moveTo(outerTopX, topSp.y);
+    ctx.quadraticCurveTo(midSp.x + sign * 41, midSp.y, outerBotX, botSp.y - 1);
+    ctx.stroke();
 
-      for (const sm of paw.smears) {
-        ctx.save();
-        ctx.globalAlpha = Math.max(0, sm.alpha * activeArmWeight);
-        this.drawPlumpCatArm(ctx, paw.side, sm.sx, sm.sy, sm.px, sm.py, 0, false);
-        ctx.restore();
-      }
-
-      // Keep mouse-reaching arm pure velvet black in open air (ORIG 2.2s); show subtle separation lines when poking across black torso!
-      this.drawPlumpCatArm(ctx, paw.side, sh.x, sh.y, px, py, paw.impactSquash, paw.mode !== 'mouse');
-      ctx.restore();
-    }
+    // Inner front-leg gap line (tapers slightly outward toward paws, exact inverted narrow V from ORIG 0.3s!)
+    ctx.beginPath();
+    ctx.moveTo(innerTopX, topSp.y + 10);
+    ctx.lineTo(innerBotX, botSp.y - 1);
+    ctx.stroke();
   }
 
   private drawKeyBubbles(ctx: CanvasRenderingContext2D): void {
@@ -2574,28 +2786,7 @@ export class KuroCatEngine {
     ctx.shadowBlur = s.isDarkBase ? 1.6 : 5;
     if (!s.isDarkBase) ctx.shadowOffsetY = 2;
 
-    // 1) Grounded hind paws when front paws lift
-    const anyFrontLifted = this.leftPaw.idleWeight < 0.7 || this.rightPaw.idleWeight < 0.7;
-    if (anyFrontLifted) {
-      ctx.fillStyle = s.pawColor;
-      ctx.strokeStyle = s.pawOutlineColor || s.outlineColor || 'transparent';
-      ctx.lineWidth = 1.85;
-      for (const [fx, fy, rx, ry] of [
-        [basePt.x - 42, basePt.y - 3, 14.5, 11.5],
-        [basePt.x + 32, basePt.y - 1, 15.0, 11.5],
-      ]) {
-        ctx.beginPath();
-        ctx.ellipse(fx, fy, rx, ry, 0, 0, Math.PI * 2);
-        ctx.fill();
-        if (s.pawOutlineColor || s.outlineColor) {
-          ctx.save();
-          ctx.shadowBlur = 0;
-          ctx.shadowOffsetY = 0;
-          ctx.stroke();
-          ctx.restore();
-        }
-      }
-    }
+    this.drawHindPaws(ctx, basePt, s.pawColor, s.pawOutlineColor || s.outlineColor);
 
     // 2) Unified flexible body path
     const traceBodyPath = () => {
@@ -3066,197 +3257,6 @@ export class KuroCatEngine {
     }
   }
 
-  private drawCustomPlumpArm(
-    ctx: CanvasRenderingContext2D,
-    s: ResolvedSkin,
-    side: 'left' | 'right',
-    sx: number,
-    sy: number,
-    px: number,
-    py: number,
-    squash: number,
-    withCrease: boolean,
-  ): void {
-    const dx = px - sx;
-    const dy = py - sy;
-    const len = Math.max(1, Math.hypot(dx, dy));
-    const ux = dx / len;
-    const uy = dy / len;
-    const nx = -uy;
-    const ny = ux;
-    const wristDist = Math.max(6, len - 8);
-    const wx = sx + ux * wristDist;
-    const wy = sy + uy * wristDist;
-    const rShoulder = 14.2;
-    const rWrist = 9.4;
-    const pawRx = 14.5 * (1 + squash * 0.14);
-    const pawRy = 11.8 * (1 - squash * 0.12);
-
-    ctx.save();
-    const traceArmPath = () => {
-      ctx.beginPath();
-      ctx.moveTo(sx + nx * rShoulder, sy + ny * rShoulder);
-      ctx.quadraticCurveTo(
-        (sx + wx) * 0.5 + nx * (rShoulder * 0.84),
-        (sy + wy) * 0.5 + ny * (rShoulder * 0.84),
-        wx + nx * rWrist,
-        wy + ny * rWrist,
-      );
-      ctx.lineTo(wx - nx * rWrist, wy - ny * rWrist);
-      ctx.quadraticCurveTo(
-        (sx + wx) * 0.5 - nx * (rShoulder * 0.84),
-        (sy + wy) * 0.5 - ny * (rShoulder * 0.84),
-        sx - nx * rShoulder,
-        sy - ny * rShoulder,
-      );
-      ctx.closePath();
-    };
-
-    ctx.fillStyle = s.armColor;
-    traceArmPath();
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.arc(sx, sy, rShoulder, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Custom arm spots
-    const armPart = side === 'left' ? 'leftArm' : 'rightArm';
-    const armSpots = s.spots.filter((sp) => sp.part === armPart);
-    if (armSpots.length > 0 && len > 24) {
-      const armAng = Math.atan2(dy, dx);
-      ctx.save();
-      traceArmPath();
-      ctx.clip();
-      for (const sp of armSpots) {
-        const frac = Math.max(0.1, Math.min(0.9, sp.x));
-        ctx.globalAlpha = sp.opacity ?? 0.85;
-        ctx.fillStyle = sp.color;
-        ctx.beginPath();
-        ctx.ellipse(
-          sx + ux * (len * frac) + nx * sp.y,
-          sy + uy * (len * frac) + ny * sp.y,
-          Math.max(2, sp.rx),
-          Math.max(2, sp.ry),
-          armAng + (sp.rotation || 0),
-          0,
-          Math.PI * 2,
-        );
-        ctx.fill();
-      }
-      ctx.restore();
-    }
-
-    // Mitten paw ball
-    ctx.save();
-    if (!s.isDarkBase) {
-      ctx.shadowColor = 'rgba(36, 32, 30, 0.22)';
-      ctx.shadowBlur = 4;
-      ctx.shadowOffsetY = 1.5;
-    }
-    ctx.fillStyle = s.pawColor;
-    ctx.beginPath();
-    ctx.ellipse(px, py, pawRx, pawRy, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-
-    const edgeColor = s.pawOutlineColor || s.outlineColor;
-    if (edgeColor) {
-      ctx.lineWidth = 1.65;
-      ctx.lineCap = 'round';
-      for (const sgn of [-1, 1]) {
-        const startFrac = withCrease ? 0.16 : 0.08;
-        const esx = sx + ux * (len * startFrac) + nx * sgn * (rShoulder * (1 - startFrac * 0.16));
-        const esy = sy + uy * (len * startFrac) + ny * sgn * (rShoulder * (1 - startFrac * 0.16));
-        ctx.strokeStyle = edgeColor;
-        ctx.globalAlpha = 0.85;
-        ctx.beginPath();
-        ctx.moveTo(esx, esy);
-        ctx.quadraticCurveTo(
-          (sx + wx) * 0.5 + nx * sgn * (rShoulder * 0.84),
-          (sy + wy) * 0.5 + ny * sgn * (rShoulder * 0.84),
-          wx + nx * sgn * rWrist,
-          wy + ny * sgn * rWrist,
-        );
-        ctx.stroke();
-      }
-      const pawAng = Math.atan2(dy, dx);
-      ctx.globalAlpha = 0.92;
-      ctx.strokeStyle = edgeColor;
-      ctx.beginPath();
-      ctx.ellipse(px, py, pawRx, pawRy, 0, pawAng - Math.PI * 0.62, pawAng + Math.PI * 0.62);
-      ctx.stroke();
-    } else if (s.armCreaseColor && withCrease && len > 28) {
-      for (const sgn of [-1, 1]) {
-        const csx = sx + ux * (len * 0.18) + nx * sgn * (rShoulder * 0.86);
-        const csy = sy + uy * (len * 0.18) + ny * sgn * (rShoulder * 0.86);
-        const cex = sx + ux * (len * 0.72) + nx * sgn * (rWrist * 1.02);
-        const cey = sy + uy * (len * 0.72) + ny * sgn * (rWrist * 1.02);
-        ctx.strokeStyle = s.armCreaseColor;
-        ctx.lineWidth = 1.3;
-        ctx.lineCap = 'round';
-        ctx.beginPath();
-        ctx.moveTo(csx, csy);
-        ctx.lineTo(cex, cey);
-        ctx.stroke();
-      }
-    }
-
-    ctx.restore();
-  }
-
-  private drawCustomBentArm(
-    ctx: CanvasRenderingContext2D,
-    s: ResolvedSkin,
-    paw: PawState,
-    breath: number,
-    alpha: number,
-  ): void {
-    const sh = this.getLiveShoulder(paw, breath);
-    const cp = this.getLiveCurledPawPos(paw, breath);
-    const sign = paw.side === 'left' ? -1 : 1;
-    const elbowX = sh.x + sign * 8;
-    const elbowY = cp.y + 8;
-
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-
-    ctx.strokeStyle = s.armColor;
-    ctx.lineWidth = 20;
-    ctx.beginPath();
-    ctx.moveTo(sh.x, sh.y);
-    ctx.quadraticCurveTo(elbowX, elbowY, cp.x, cp.y);
-    ctx.stroke();
-
-    const armPart = paw.side === 'left' ? 'leftArm' : 'rightArm';
-    for (const sp of s.spots) {
-      if (sp.part !== armPart) continue;
-      ctx.save();
-      ctx.globalAlpha = alpha * (sp.opacity ?? 0.82);
-      ctx.fillStyle = sp.color;
-      ctx.beginPath();
-      ctx.ellipse((elbowX + cp.x) * 0.5, (elbowY + cp.y) * 0.5, Math.min(8, sp.rx), Math.min(6, sp.ry), -0.3 * sign, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-
-    ctx.fillStyle = s.pawColor;
-    ctx.beginPath();
-    ctx.ellipse(cp.x, cp.y, 12.5, 11.0, sign * 0.2, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = s.pawOutlineColor || s.legLineColor;
-    ctx.lineWidth = 1.55;
-    ctx.beginPath();
-    ctx.moveTo(elbowX + sign * 8, elbowY - 16);
-    ctx.quadraticCurveTo(elbowX + sign * 4, elbowY + 12, cp.x + sign * 2, cp.y + 10);
-    ctx.quadraticCurveTo(cp.x - sign * 11, cp.y + 8, cp.x - sign * 12, cp.y - 4);
-    ctx.stroke();
-    ctx.restore();
-  }
-
   private drawCustomIdleLegDetails(
     ctx: CanvasRenderingContext2D,
     s: ResolvedSkin,
@@ -3274,7 +3274,7 @@ export class KuroCatEngine {
     for (const sp of s.spots) {
       if (sp.part !== armPart) continue;
       ctx.save();
-      ctx.globalAlpha = sp.opacity ?? 0.82;
+      ctx.globalAlpha *= sp.opacity ?? 0.82;
       ctx.fillStyle = sp.color;
       ctx.beginPath();
       ctx.ellipse(midSp.x + sign * 21, midSp.y + (sp.x - 0.5) * 28, Math.max(3, sp.rx * 0.8), Math.max(3, sp.ry * 1.1), 0.2 * sign, 0, Math.PI * 2);

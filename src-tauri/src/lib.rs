@@ -138,7 +138,9 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
         let s = state.settings.lock().unwrap();
         (s.autostart, s.scale, s.keyboard_layout.clone())
     };
-    if patch.autostart != prev_autostart {
+    if config::TRACKPAD_PREVIEW {
+        patch.autostart = false;
+    } else if patch.autostart != prev_autostart {
         let _ = set_windows_autostart(patch.autostart);
     }
 
@@ -185,11 +187,18 @@ fn set_update_banner_open(state: State<'_, AppState>, open: bool) {
 
 #[tauri::command]
 fn get_app_version() -> String {
-    updater::CURRENT_VERSION.to_string()
+    if config::TRACKPAD_PREVIEW {
+        format!("{} · 触控板试用", updater::CURRENT_VERSION)
+    } else {
+        updater::CURRENT_VERSION.to_string()
+    }
 }
 
 #[tauri::command]
 async fn check_for_update() -> Result<updater::UpdateInfo, String> {
+    if config::TRACKPAD_PREVIEW {
+        return Err("触控板试用版不检查更新".to_string());
+    }
     tauri::async_runtime::spawn_blocking(updater::check_latest_update)
         .await
         .map_err(|e| format!("检查更新任务异常: {}", e))?
@@ -197,6 +206,9 @@ async fn check_for_update() -> Result<updater::UpdateInfo, String> {
 
 #[tauri::command]
 async fn install_update(app: AppHandle, info: updater::UpdateInfo) -> Result<(), String> {
+    if config::TRACKPAD_PREVIEW {
+        return Err("触控板试用版不安装更新".to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || updater::perform_update_install(&app, info))
         .await
         .map_err(|e| format!("安装更新任务异常: {}", e))?
@@ -784,18 +796,29 @@ pub fn configure_macos_fullscreen_overlay(win: &tauri::WebviewWindow, always_on_
     }
 }
 
-fn is_over_interactive_silhouette(rx: f64, ry: f64, is_108: bool) -> (bool, bool) {
-    // Cat body/head oval centered around (0.48, 0.49) for 65% or (0.51, 0.48) for 108-key
-    let (cat_cx, cat_rx) = if is_108 { (0.51, 0.21) } else { (0.48, 0.25) };
+fn is_over_interactive_silhouette(
+    rx: f64, ry: f64, is_108: bool, viewer_facing: bool, trackpad: bool,
+) -> (bool, bool) {
+    let (cat_cx, cat_rx) = if is_108 {
+        (0.51, 0.21)
+    } else {
+        let center = match (viewer_facing, trackpad) {
+            (true, true) => 0.40,
+            (false, true) => 0.64,
+            (true, false) => 0.45,
+            (false, false) => 0.55,
+        };
+        (center, 0.25)
+    };
     let dx_cat = (rx - cat_cx) / cat_rx;
     let dy_cat = (ry - 0.49) / 0.27;
     let over_cat = (dx_cat * dx_cat + dy_cat * dy_cat) <= 1.0;
 
-    // Keyboard & mouse lower area
+    let desk_x = if viewer_facing { 1.0 - rx } else { rx };
     let over_desk = if is_108 {
-        rx >= 0.04 && rx <= 0.94 && ry >= 0.65 && ry <= 0.94
+        (0.02..=0.94).contains(&desk_x) && (0.65..=0.94).contains(&ry)
     } else {
-        rx >= 0.06 && rx <= 0.92 && ry >= 0.65 && ry <= 0.91
+        (0.02..=0.98).contains(&desk_x) && (0.65..=0.93).contains(&ry)
     };
 
     (over_cat || over_desk, over_cat)
@@ -852,7 +875,7 @@ fn start_hit_test_loop(
             let rx = (cx - pos.x) as f64 / w;
             let ry = (cy - pos.y) as f64 / h;
             let inside = rx >= 0.0 && rx <= 1.0 && ry >= 0.0 && ry <= 1.0;
-            let (locked, always_on_top, is_108, cur_scale, layout_str) = {
+            let (locked, always_on_top, is_108, cur_scale, layout_str, viewer_facing, trackpad) = {
                 let s = settings.lock().unwrap();
                 (
                     s.click_through_locked,
@@ -860,6 +883,8 @@ fn start_hit_test_loop(
                     s.keyboard_layout == "108",
                     s.scale.clamp(0.20, 1.50),
                     s.keyboard_layout.clone(),
+                    s.keyboard_orientation == "viewer",
+                    matches!(s.pointer_device, config::PointerDevice::Trackpad),
                 )
             };
 
@@ -949,7 +974,7 @@ fn start_hit_test_loop(
             let inside_pet = pet_rx >= 0.0 && pet_rx <= 1.0 && pet_ry >= 0.0 && pet_ry <= 1.0;
 
             let (over_interactive, raw_over_cat) = if inside_pet {
-                is_over_interactive_silhouette(pet_rx, pet_ry, is_108)
+                is_over_interactive_silhouette(pet_rx, pet_ry, is_108, viewer_facing, trackpad)
             } else {
                 (false, false)
             };
@@ -1127,7 +1152,9 @@ pub fn run() {
                 paused_for_setup,
             );
             start_storage_watcher(handle.clone());
-            updater::start_background_update_checker(handle.clone());
+            if !config::TRACKPAD_PREVIEW {
+                updater::start_background_update_checker(handle.clone());
+            }
 
             let http_handle = handle.clone();
             let mcp_port = if s.mcp_port == 0 { 27420 } else { s.mcp_port };

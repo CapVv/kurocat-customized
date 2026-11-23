@@ -2,7 +2,7 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { KuroCatEngine, type KeyboardOrientation } from './catEngine';
+import { KuroCatEngine, type KeyboardOrientation, type PointerDevice } from './catEngine';
 import { catAudio } from './audio';
 import { DEFAULT_BUILTIN_CATS, type CatSkinConfig } from './catSkins';
 import type { KeyboardLayoutId } from './keyboardLayout';
@@ -21,6 +21,7 @@ interface AppSettings {
   mcpPort: number;
   keyboardLayout: KeyboardLayoutId;
   keyboardOrientation: KeyboardOrientation;
+  pointerDevice?: PointerDevice;
   privacyPasswordGuard: boolean;
 }
 
@@ -83,6 +84,7 @@ let settings: AppSettings = {
   mcpPort: 27420,
   keyboardLayout: '65',
   keyboardOrientation: 'cat',
+  pointerDevice: 'mouse',
   privacyPasswordGuard: true,
 };
 
@@ -98,7 +100,7 @@ const updateToastTextEl = document.getElementById('update-toast-text') as HTMLSp
 const btnToastInstallEl = document.getElementById('btn-toast-install') as HTMLButtonElement;
 const btnToastOpenEl = document.getElementById('btn-toast-open') as HTMLButtonElement;
 const btnToastCloseEl = document.getElementById('btn-toast-close') as HTMLButtonElement;
-const engine = new KuroCatEngine(canvas);
+const engine = new KuroCatEngine(canvas, { personalDesk: true });
 
 function renderBreedPills(): void {
   if (!breedPillsEl) return;
@@ -167,6 +169,13 @@ function syncMenuUI(): void {
   engine.showKeyBubbles = settings.showKeyBubbles;
   engine.setCatAppearance(activeCat?.id || 'black', activeCat);
   engine.setKeyboardConfig(kbLayout, kbOrient);
+  const pointerDevice = settings.pointerDevice === 'trackpad' ? 'trackpad' : 'mouse';
+  engine.setPointerDevice(pointerDevice);
+  document.querySelectorAll<HTMLButtonElement>('[data-pointerdevice]').forEach((btn) => {
+    const active = btn.dataset.pointerdevice === pointerDevice;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
+  });
   if (!sliderDragging) {
     engine.setRenderScale(settings.scale);
   }
@@ -403,6 +412,10 @@ async function bootstrap(): Promise<void> {
     if (loadedVer) {
       appVersion = loadedVer;
       setUpdateHint(`v${appVersion}`);
+      if (appVersion.endsWith(' · 触控板试用')) {
+        menuEl.querySelectorAll<HTMLElement>('[data-action="check-update"], [data-action="toggle-autostart"]')
+          .forEach((button) => { button.style.display = 'none'; });
+      }
     }
     syncMenuUI();
   } catch (err) {
@@ -502,7 +515,7 @@ async function bootstrap(): Promise<void> {
         engine.onMouseUp(p.button);
         break;
       case 'mouseWheel':
-        engine.onMouseWheel();
+        engine.onMouseWheel(p.delta);
         break;
       case 'privacyTyping':
         engine.onPrivacyTyping();
@@ -553,7 +566,7 @@ async function bootstrap(): Promise<void> {
 
   menuEl.addEventListener('click', (e) => {
     const target = (e.target as HTMLElement).closest<HTMLElement>(
-      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient]',
+      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient], [data-pointerdevice]',
     );
     if (!target) return;
 
@@ -567,6 +580,13 @@ async function bootstrap(): Promise<void> {
     const kbOrientAttr = target.dataset.kborient;
     if (kbOrientAttr === 'cat' || kbOrientAttr === 'viewer') {
       void applySettingsPatch({ keyboardOrientation: kbOrientAttr });
+      closeContextMenu();
+      return;
+    }
+
+    const pointerDevice = target.dataset.pointerdevice;
+    if (pointerDevice === 'mouse' || pointerDevice === 'trackpad') {
+      void applySettingsPatch({ pointerDevice });
       closeContextMenu();
       return;
     }

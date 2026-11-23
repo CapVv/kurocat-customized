@@ -14,8 +14,10 @@ fn default_privacy_password_guard() -> bool {
     true
 }
 
+pub const TRACKPAD_PREVIEW: bool = option_env!("KUROCAT_TRACKPAD_PREVIEW").is_some();
+
 fn default_mcp_port() -> u16 {
-    27420
+    if TRACKPAD_PREVIEW { 27421 } else { 27420 }
 }
 
 pub fn default_keyboard_layout() -> String {
@@ -46,6 +48,19 @@ pub fn normalize_keyboard_orientation(raw: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PointerDevice {
+    Mouse,
+    Trackpad,
+}
+
+impl Default for PointerDevice {
+    fn default() -> Self {
+        if TRACKPAD_PREVIEW { Self::Trackpad } else { Self::Mouse }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -67,6 +82,8 @@ pub struct AppSettings {
     pub keyboard_layout: String,
     #[serde(default = "default_keyboard_orientation")]
     pub keyboard_orientation: String,
+    #[serde(default)]
+    pub pointer_device: PointerDevice,
     #[serde(default = "default_privacy_password_guard")]
     pub privacy_password_guard: bool,
 }
@@ -87,6 +104,7 @@ impl Default for AppSettings {
             mcp_port: default_mcp_port(),
             keyboard_layout: default_keyboard_layout(),
             keyboard_orientation: default_keyboard_orientation(),
+            pointer_device: PointerDevice::default(),
             privacy_password_guard: default_privacy_password_guard(),
         }
     }
@@ -105,9 +123,8 @@ pub fn app_data_dir() -> PathBuf {
         let home = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
-        home.join("Library")
-            .join("Application Support")
-            .join("kuro-cat-pet")
+        let directory = if TRACKPAD_PREVIEW { "kuro-cat-pet-trackpad" } else { "kuro-cat-pet" };
+        home.join("Library").join("Application Support").join(directory)
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
@@ -212,6 +229,9 @@ pub fn set_windows_autostart(enabled: bool) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub fn set_windows_autostart(enabled: bool) -> Result<(), String> {
+    if TRACKPAD_PREVIEW {
+        return Err("触控板试用版不设置开机启动".to_string());
+    }
     let home = std::env::var("HOME").map_err(|e| e.to_string())?;
     let agents_dir = PathBuf::from(home).join("Library").join("LaunchAgents");
     let plist_path = agents_dir.join("com.kurocat.pet.plist");

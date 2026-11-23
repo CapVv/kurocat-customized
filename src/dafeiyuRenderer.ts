@@ -4,6 +4,7 @@ import shyUrl from './assets/dafeiyu/notail_shy.webp';
 import happyUrl from './assets/dafeiyu/notail_happy2.webp';
 
 export interface DaFeiYuLayout {
+  charX: number;
   logicalW: number;
   kbCenterX: number;
   kbCenterY: number;
@@ -13,9 +14,10 @@ export interface DaFeiYuLayout {
   mouseBtnX: number;
   mouseBtnY: number;
   mouseNX: number;
+  pointerOnRight: boolean;
   mouseLeft: boolean;
   mouseRight: boolean;
-  mouseActiveAt: number;
+  mouseActive: boolean;
   petEnergy: number;
   privacyMode: boolean;
   privacyTypingAt: number;
@@ -139,8 +141,9 @@ export class DaFeiYuRenderer {
     this.bodyBob = Math.min(0.65, this.bodyBob + 0.42);
   }
 
-  public resetLeftHandForMouse(): void {
-    this.leftHand.lastAt = -10000;
+  public resetPointerHand(pointerOnRight: boolean): void {
+    const hand = pointerOnRight ? this.rightHand : this.leftHand;
+    hand.lastAt = -10000;
   }
 
   public onKeyDown(
@@ -155,9 +158,9 @@ export class DaFeiYuRenderer {
     this.keyTimes.push(now);
     this.bodyBob = Math.min(1.1, this.bodyBob + 0.72);
 
-    const charX = layout.is108 ? 268 : 192;
+    const charX = layout.charX;
     const normX = Math.max(-1, Math.min(1, (pt.x - layout.kbCenterX) / (layout.kbWidth * 0.46)));
-    const mouseBusy = layout.mouseLeft || layout.mouseRight || now - layout.mouseActiveAt < 900;
+    const mouseBusy = layout.mouseActive;
     const isLeftSide = pt.x < layout.kbCenterX - 2;
     const rightEdgeThreshold = layout.kbCenterX + layout.kbWidth * (layout.is108 ? 0.16 : 0.215);
 
@@ -177,16 +180,16 @@ export class DaFeiYuRenderer {
       this.ripples.push({ x: pt.x, y: pt.y, r: 2, life: 0.85 });
       this.spawnParticles(pt.x, pt.y - 8, 3, true);
     } else if (mouseBusy) {
-      // Simultaneous mouse + keyboard: left hand stays glued on mouse, right hand taps main keyboard!
-      const shiftBase = layout.is108 ? -88 : -38;
-      const curCharX = charX + shiftBase;
-      const comfortX = Math.max(curCharX - 10, Math.min(curCharX + 92, pt.x));
-      const comfortY = Math.min(layout.kbCenterY + 6, pt.y);
-      this.rightHand.tx = comfortX;
-      this.rightHand.ty = comfortY;
-      this.rightHand.lastAt = now;
-      this.rightHand.squash = 1;
-      this.rightHand.heldVks.add(vk);
+      const reach = layout.is108 ? 88 : 38;
+      const hand = layout.pointerOnRight ? this.leftHand : this.rightHand;
+      const center = layout.pointerOnRight ? layout.logicalW - charX + reach : charX - reach;
+      const minX = center - (layout.pointerOnRight ? 92 : 10);
+      const maxX = center + (layout.pointerOnRight ? 10 : 92);
+      hand.tx = Math.max(minX, Math.min(maxX, pt.x));
+      hand.ty = Math.min(layout.kbCenterY + 6, pt.y);
+      hand.lastAt = now;
+      hand.squash = 1;
+      hand.heldVks.add(vk);
     } else {
       // Cozy two-handed typing with gentle micro-sway (±5.5°)
       this.bodyTiltTarget = normX * 0.095;
@@ -250,7 +253,7 @@ export class DaFeiYuRenderer {
     const mouseMode =
       !layout.privacyMode &&
       !isHappy &&
-      (layout.mouseLeft || layout.mouseRight || now - layout.mouseActiveAt < 900);
+      layout.mouseActive;
 
     // 1) Calm 2.8s typing-speed window + hysteresis-locked blush mood (min 2.2s dwell, zero flicker!)
     while (this.keyTimes.length && now - this.keyTimes[0] > 2800) {
@@ -301,7 +304,7 @@ export class DaFeiYuRenderer {
       this.nextBlinkAt = now + 4500 + Math.random() * 2700;
     }
 
-    const charX = layout.is108 ? 268 : 192;
+    const charX = layout.charX;
     if (isHappy && Math.random() < 0.06) {
       this.spawnParticles(charX + this.bodyShiftX, 120, 1, false);
     } else if (!layout.privacyMode && this.moodTier === 2 && Math.random() < 0.025) {
@@ -317,9 +320,10 @@ export class DaFeiYuRenderer {
       this.bodyTiltTarget = shySway;
       this.bodyDiveY *= Math.exp(-9 * dt);
     } else if (mouseMode) {
-      const baseShift = layout.is108 ? -125 : -38;
+      const reach = layout.is108 ? 125 : 38;
+      const baseShift = layout.pointerOnRight ? layout.logicalW - 2 * charX + reach : -reach;
       this.bodyShiftTarget = baseShift + (layout.mouseNX - 0.5) * 12;
-      this.bodyTiltTarget = -0.10;
+      this.bodyTiltTarget = layout.pointerOnRight ? 0.10 : -0.10;
       this.bodyDiveY += (8 - this.bodyDiveY) * (1 - Math.exp(-10 * dt));
     } else if (!isTyping) {
       this.bodyShiftTarget = 0;
@@ -354,7 +358,7 @@ export class DaFeiYuRenderer {
   }
 
   private computeGeom(now: number, layout: DaFeiYuLayout) {
-    const charX = layout.is108 ? 268 : 192;
+    const charX = layout.charX;
     const baseCharY = layout.is108 ? 366 : 364;
     const breath = Math.sin(now * 0.0034) * 2.2 + this.bodyBob * 3.8 + this.bodyDiveY;
     const charCenterX = charX + this.bodyShiftX;
@@ -467,7 +471,7 @@ export class DaFeiYuRenderer {
     const mouseMode =
       !layout.privacyMode &&
       !isHappy &&
-      (layout.mouseLeft || layout.mouseRight || now - layout.mouseActiveAt < 900);
+      layout.mouseActive;
 
     // 1) Water slap ripples on keyboard
     for (const rp of this.ripples) {
@@ -517,12 +521,15 @@ export class DaFeiYuRenderer {
     this.drawWhaleTail(ctx, tailRoot.x, tailRoot.y, this.tail.x, this.tail.y, this.tail.phase, activeWag, layout.logicalW);
 
     // 3) Pure round chibi hands (covering closed eyes in privacyMode!)
+    const leftUsingPointer = mouseMode && !layout.pointerOnRight;
+    const rightUsingPointer = mouseMode && layout.pointerOnRight;
     const leftTyping =
       !layout.privacyMode &&
-      !mouseMode &&
+      !leftUsingPointer &&
       (now - this.leftHand.lastAt < 380 || this.leftHand.heldVks.size > 0);
     const rightTyping =
       !layout.privacyMode &&
+      !rightUsingPointer &&
       (now - this.rightHand.lastAt < 380 || this.rightHand.heldVks.size > 0);
 
     let lTargetX: number;
@@ -544,8 +551,8 @@ export class DaFeiYuRenderer {
       rTargetX = shR.x + 14;
       rTargetY = shR.y + 4 - cheer;
     } else {
-      if (mouseMode) {
-        const pressOff = layout.mouseLeft || layout.mouseRight ? 2.5 : 0;
+      const pressOff = layout.mouseLeft || layout.mouseRight ? 2.5 : 0;
+      if (leftUsingPointer) {
         lTargetX = layout.mouseBtnX;
         lTargetY = layout.mouseBtnY + pressOff;
       } else if (leftTyping) {
@@ -555,7 +562,10 @@ export class DaFeiYuRenderer {
         lTargetX = shL.x - 15;
         lTargetY = shL.y + 34;
       }
-      if (rightTyping) {
+      if (rightUsingPointer) {
+        rTargetX = layout.mouseBtnX;
+        rTargetY = layout.mouseBtnY + pressOff;
+      } else if (rightTyping) {
         rTargetX = this.rightHand.tx;
         rTargetY = this.rightHand.ty;
       } else {
@@ -581,7 +591,7 @@ export class DaFeiYuRenderer {
       this.leftHand.y,
       'left',
       this.leftHand.squash,
-      mouseMode ? maxMouseReach : 72,
+      leftUsingPointer ? maxMouseReach : mouseMode ? 86 : 72,
     );
     this.drawChubbyArm(
       ctx,
@@ -591,7 +601,7 @@ export class DaFeiYuRenderer {
       this.rightHand.y,
       'right',
       this.rightHand.squash,
-      mouseMode ? 86 : 72,
+      rightUsingPointer ? maxMouseReach : mouseMode ? 86 : 72,
     );
 
     // 4) Water droplets & hearts
