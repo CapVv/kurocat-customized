@@ -1,6 +1,6 @@
 {
   "name": "kuro-cat-pet",
-  "version": "4.7.0",
+  "version": "4.9.1",
   "private": true,
   "description": "Adorable transparent black cat desktop typing & mouse companion for Windows and macOS",
   "type": "module",
@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "build:web": "vite build --config vite.web.config.ts",
+    "build:android-web": "vite build --config vite.android.config.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

@@ -1,7 +1,7 @@
-import idleUrl from './assets/dafeiyu/notail_idle.webp';
-import blinkUrl from './assets/dafeiyu/notail_blink.webp';
-import shyUrl from './assets/dafeiyu/notail_shy.webp';
-import happyUrl from './assets/dafeiyu/notail_happy2.webp';
+import idleUrl from './assets/dafeiyu/notail_idle.png';
+import blinkUrl from './assets/dafeiyu/notail_blink.png';
+import shyUrl from './assets/dafeiyu/notail_shy.png';
+import happyUrl from './assets/dafeiyu/notail_happy2.png';
 
 export interface DaFeiYuLayout {
   charX: number;
@@ -18,6 +18,7 @@ export interface DaFeiYuLayout {
   mouseLeft: boolean;
   mouseRight: boolean;
   mouseActive: boolean;
+  mouseClickAt: number;
   petEnergy: number;
   privacyMode: boolean;
   privacyTypingAt: number;
@@ -53,14 +54,21 @@ interface FloatingParticle {
 /**
  * BigFish (大肥鱼 / 鲸鱼娘) companion renderer for KuroCat.
  * Uses MIT-licensed `PC2005-cloud/dsh-pet` (via `QCYTSN/dsh-dafeiyu`) armless/tailless sprites
- * with procedural pure-round chibi hands, plump flared maid sleeves, animated ocean-blue whale tail
- * slapping right-edge keys, calm hysteresis-locked typing-speed cheek blush, 3-limb simultaneous
- * mouse+keyboard+tail support, and adorable hands-covering-eyes password privacy mode.
+ * with Live2D-style eye gaze tracking toward mouse/keyboard, procedural pure-round chibi hands,
+ * plump flared maid sleeves, animated ocean-blue whale tail slapping right-edge keys,
+ * calm hysteresis-locked typing-speed cheek blush, 3-limb simultaneous mouse+keyboard+tail
+ * support, and adorable hands-covering-eyes password privacy mode.
  */
 export class DaFeiYuRenderer {
   private sprites: Record<'idle' | 'blink' | 'shy' | 'happy', HTMLImageElement>;
+  private hairBangsCanvas: HTMLCanvasElement | null = null;
+  private hairBangsAttempted = false;
 
   private lastKeyAt = -10000;
+  private lastKeyGazeAt = -10000;
+  private lastKeyPtX = 214;
+  private lastKeyPtY = 353;
+  private lastMouseClickAt = -10000;
   private keyTimes: number[] = [];
   private typingHeat = 0;
   private blushLevel = 0;
@@ -68,6 +76,10 @@ export class DaFeiYuRenderer {
   private moodChangedAt = -10000;
   private nextBlinkAt = performance.now() + 3600 + Math.random() * 2600;
   private blinkUntil = 0;
+
+  // Live2D eye gaze offset in native 224x278 sprite pixel coordinates
+  private eyeGazeX = 0;
+  private eyeGazeY = 0;
 
   private bodyShiftX = 0;
   private bodyShiftVel = 0;
@@ -98,10 +110,9 @@ export class DaFeiYuRenderer {
   };
 
   private tail = {
-    x: 320,
-    y: 280,
-    tx: 320,
-    ty: 280,
+    relX: 84,
+    relY: -36,
+    activeWag: 0,
     slapAt: -10000,
     releaseAt: -10000,
     slapTargetX: 340,
@@ -146,15 +157,50 @@ export class DaFeiYuRenderer {
     hand.lastAt = -10000;
   }
 
+  public onMouseAction(now: number = performance.now()): void {
+    this.lastMouseClickAt = now;
+  }
+
+  public getHandBusyState(now: number): { leftHeld: number; rightHeld: number; rightBusy: boolean } {
+    const leftHeld = this.leftHand.heldVks.size;
+    const rightHeld = this.rightHand.heldVks.size;
+    const rightBusy = rightHeld > 0 || now - this.rightHand.lastAt < 135;
+    return { leftHeld, rightHeld, rightBusy };
+  }
+
+  public triggerTailPreview(pt: { x: number; y: number }, layout: DaFeiYuLayout): void {
+    if (layout.privacyMode) return;
+    const now = performance.now();
+    this.lastKeyGazeAt = now;
+    this.lastKeyPtX = pt.x;
+    this.lastKeyPtY = pt.y;
+    this.tail.slapAt = now;
+    this.tail.releaseAt = now + 220;
+    this.tail.slapTargetX = pt.x;
+    this.tail.slapTargetY = pt.y;
+    this.tail.squash = 1;
+    this.bodyBob = Math.min(1.0, this.bodyBob + 0.55);
+    const normX = Math.max(-1, Math.min(1, (pt.x - layout.kbCenterX) / (layout.kbWidth * 0.46)));
+    this.bodyTiltTarget = normX * 0.065;
+    this.bodyShiftTarget = normX * 8;
+    this.ripples.push({ x: pt.x, y: pt.y, r: 6, life: 1 });
+    this.ripples.push({ x: pt.x, y: pt.y, r: 2, life: 0.85 });
+    this.spawnParticles(pt.x, pt.y - 8, 3, true);
+  }
+
   public onKeyDown(
     vk: number,
     pt: { x: number; y: number },
     layout: DaFeiYuLayout,
     repeat: boolean,
+    useTail: boolean,
   ): void {
     if (layout.privacyMode || repeat) return;
     const now = performance.now();
     this.lastKeyAt = now;
+    this.lastKeyGazeAt = now;
+    this.lastKeyPtX = pt.x;
+    this.lastKeyPtY = pt.y;
     this.keyTimes.push(now);
     this.bodyBob = Math.min(1.1, this.bodyBob + 0.72);
 
@@ -162,10 +208,9 @@ export class DaFeiYuRenderer {
     const normX = Math.max(-1, Math.min(1, (pt.x - layout.kbCenterX) / (layout.kbWidth * 0.46)));
     const mouseBusy = layout.mouseActive;
     const isLeftSide = pt.x < layout.kbCenterX - 2;
-    const rightEdgeThreshold = layout.kbCenterX + layout.kbWidth * (layout.is108 ? 0.16 : 0.215);
 
-    if (pt.x >= rightEdgeThreshold) {
-      // Right-edge action / arrow / numpad keys -> animated ocean-blue whale tail slap!
+    if (useTail) {
+      // Animated ocean-blue whale tail slap onto any configured/smart key!
       this.tail.slapAt = now;
       this.tail.releaseAt = -10000;
       this.tail.heldVks.add(vk);
@@ -173,8 +218,8 @@ export class DaFeiYuRenderer {
       this.tail.slapTargetY = pt.y;
       this.tail.squash = 1;
       if (!mouseBusy) {
-        this.bodyTiltTarget = -0.075;
-        this.bodyShiftTarget = -7;
+        this.bodyTiltTarget = normX >= 0 ? -0.075 : 0.055;
+        this.bodyShiftTarget = normX >= 0 ? -7 : 8;
       }
       this.ripples.push({ x: pt.x, y: pt.y, r: 6, life: 1 });
       this.ripples.push({ x: pt.x, y: pt.y, r: 2, life: 0.85 });
@@ -341,6 +386,98 @@ export class DaFeiYuRenderer {
     this.bodyTiltVel += tiltAcc * dt;
     this.bodyTilt += this.bodyTiltVel * dt;
 
+    // 2a) Live2D eye gaze tracking toward active mouse click / keyboard key / whale-tail slap!
+    const lastClickTs = Math.max(this.lastMouseClickAt, layout.mouseClickAt || -10000);
+    const activeMouseClick =
+      !layout.privacyMode &&
+      !isHappy &&
+      (layout.mouseLeft || layout.mouseRight || now - lastClickTs < 950);
+    const activeKeyGaze =
+      !layout.privacyMode &&
+      !isHappy &&
+      (now - this.lastKeyGazeAt < 950 ||
+        this.leftHand.heldVks.size > 0 ||
+        this.rightHand.heldVks.size > 0 ||
+        this.tail.heldVks.size > 0);
+
+    let gazeTx = 0;
+    let gazeTy = 0;
+    let hasActiveLookTarget = false;
+    let targetWX = 0;
+    let targetWY = 0;
+
+    if (activeMouseClick && (!activeKeyGaze || lastClickTs >= this.lastKeyGazeAt)) {
+      hasActiveLookTarget = true;
+      targetWX = layout.mouseBtnX;
+      targetWY = layout.mouseBtnY;
+    } else if (activeKeyGaze) {
+      hasActiveLookTarget = true;
+      targetWX = this.lastKeyPtX;
+      targetWY = this.lastKeyPtY;
+    } else if (mouseMode) {
+      hasActiveLookTarget = true;
+      targetWX = layout.mouseBtnX;
+      targetWY = layout.mouseBtnY;
+    }
+
+    if (hasActiveLookTarget) {
+      const g = this.computeGeom(now, layout);
+      const eyeWorld = g.spritePointToWorld(0.49, 0.495);
+      const wdx = targetWX - eyeWorld.x;
+      const wdy = targetWY - eyeWorld.y;
+      const c = Math.cos(-this.bodyTilt);
+      const s = Math.sin(-this.bodyTilt);
+      const localDx = wdx * c - wdy * s;
+      const localDy = wdx * s + wdy * c;
+      gazeTx = Math.max(-4.6, Math.min(4.6, localDx / 21));
+      gazeTy = Math.max(0.0, Math.min(4.3, localDy / 29));
+    }
+
+    const gazeRate = hasActiveLookTarget ? 24 : 8.5;
+    const gazeLerp = 1 - Math.exp(-gazeRate * dt);
+    this.eyeGazeX += (gazeTx - this.eyeGazeX) * gazeLerp;
+    this.eyeGazeY += (gazeTy - this.eyeGazeY) * gazeLerp;
+
+    // 2b) Whale tail physics (relative to waist anchor so rapid body shifts NEVER detach the tail!)
+    const gTail = this.computeGeom(now, layout);
+    const tailRoot = gTail.spritePointToWorld(0.56, 0.785);
+    const wagSpeed = isHappy
+      ? 0.015
+      : this.typingHeat > 0.45
+        ? 0.014
+        : isTyping
+          ? 0.0082
+          : 0.0042;
+    const idleWag = Math.sin(now * wagSpeed) * (isHappy ? 0.34 : 0.16 + this.typingHeat * 0.16);
+    const maxIdleOffX = Math.max(54, Math.min(86, layout.logicalW - 26 - tailRoot.x));
+    const idleOffX = maxIdleOffX + Math.sin(now * wagSpeed) * 9;
+    const idleOffY = -36 + Math.cos(now * wagSpeed * 1.15) * 7;
+
+    const tailAge = Math.max(0, now - this.tail.slapAt);
+    const holdingSlap =
+      !layout.privacyMode &&
+      (this.tail.heldVks.size > 0 || (this.tail.slapAt > 0 && tailAge < 260));
+    let targetPhase = 0;
+    if (holdingSlap) {
+      targetPhase = Math.min(1, tailAge / 65);
+    } else if (!layout.privacyMode && this.tail.slapAt > 0) {
+      const holdEnd = Math.max(this.tail.slapAt + 260, this.tail.releaseAt);
+      const retElapsed = Math.max(0, now - holdEnd);
+      targetPhase = Math.max(0, 1 - retElapsed / 220);
+    }
+    this.tail.phase += (targetPhase - this.tail.phase) * (1 - Math.exp(-34 * dt));
+    if (this.tail.phase < 0.002 && targetPhase === 0) this.tail.phase = 0;
+
+    const slapOffX = this.tail.slapTargetX - tailRoot.x;
+    const slapOffY = this.tail.slapTargetY - tailRoot.y;
+    const targetRelX = idleOffX + (slapOffX - idleOffX) * this.tail.phase;
+    const targetRelY = idleOffY + (slapOffY - idleOffY) * this.tail.phase;
+    const tLerp = 1 - Math.exp(-36 * dt);
+    this.tail.relX += (targetRelX - this.tail.relX) * tLerp;
+    this.tail.relY += (targetRelY - this.tail.relY) * tLerp;
+    this.tail.squash *= Math.exp(-11 * dt);
+    this.tail.activeWag = idleWag * (1 - this.tail.phase) + -0.08 * this.tail.phase;
+
     // 3) Ripples & particles
     for (let i = this.ripples.length - 1; i >= 0; i--) {
       const rp = this.ripples[i];
@@ -390,11 +527,252 @@ export class DaFeiYuRenderer {
     };
   }
 
-  /** Layer 1 (drawn BEFORE keyboard & mouse): BigFish sprite + soft lower-cheek watercolor blush. */
+  private ensureHairBangsCanvas(img: HTMLImageElement): HTMLCanvasElement | null {
+    if (this.hairBangsAttempted) return this.hairBangsCanvas;
+    if (!img.complete || img.naturalWidth <= 0) return null;
+    this.hairBangsAttempted = true;
+    try {
+      const cropX = 60;
+      const cropY = 105;
+      const cropW = 102;
+      const cropH = 42;
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = 224;
+      srcCanvas.height = 278;
+      const sctx = srcCanvas.getContext('2d', { willReadFrequently: true });
+      if (!sctx) return null;
+      sctx.drawImage(img, 0, 0, 224, 278);
+      const idata = sctx.getImageData(cropX, cropY, cropW, cropH);
+      const d = idata.data;
+      for (let ly = 0; ly < cropH; ly++) {
+        const y = cropY + ly;
+        for (let lx = 0; lx < cropW; lx++) {
+          const x = cropX + lx;
+          const idx = (ly * cropW + lx) * 4;
+          const r = d[idx];
+          const g = d[idx + 1];
+          const b = d[idx + 2];
+          const a = d[idx + 3];
+          const inCenterBangs =
+            (x >= 96 && x <= 122 && y <= 137) || (x >= 100 && x <= 118 && y <= 141);
+          const inOuterHair = (x <= 69 || x >= 149) && y <= 145;
+          const isHairPixel =
+            a > 90 && ((r < 175 && b >= r - 6) || (r < 125 && g < 120 && b < 165));
+          if (!((inCenterBangs || inOuterHair) && isHairPixel)) {
+            d[idx + 3] = 0;
+          }
+        }
+      }
+      const out = document.createElement('canvas');
+      out.width = cropW;
+      out.height = cropH;
+      const octx = out.getContext('2d');
+      if (!octx) return null;
+      octx.putImageData(idata, 0, 0);
+      this.hairBangsCanvas = out;
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  private traceClosedSpline(
+    ctx: CanvasRenderingContext2D,
+    pts: ReadonlyArray<readonly [number, number]>,
+  ): void {
+    const n = pts.length;
+    if (n < 3) return;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 0; i < n; i++) {
+      const p0 = pts[(i - 1 + n) % n];
+      const p1 = pts[i];
+      const p2 = pts[(i + 1) % n];
+      const p3 = pts[(i + 2) % n];
+      const cp1x = p1[0] + (p2[0] - p0[0]) / 6;
+      const cp1y = p1[1] + (p2[1] - p0[1]) / 6;
+      const cp2x = p2[0] - (p3[0] - p1[0]) / 6;
+      const cp2y = p2[1] - (p3[1] - p1[1]) / 6;
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2[0], p2[1]);
+    }
+    ctx.closePath();
+  }
+
+  /**
+   * Draws Live2D-style moving sapphire eyes in native 224x278 sprite space when looking toward mouse/keyboard.
+   * Smoothly crossfades to 100% original untouched sprite pixels when looking straight ahead at rest.
+   */
+  private renderLiveEyes(
+    ctx: CanvasRenderingContext2D,
+    gazeX: number,
+    gazeY: number,
+    idleImg: HTMLImageElement,
+  ): void {
+    const gazeMag = Math.hypot(gazeX, gazeY);
+    const alpha = Math.min(1, gazeMag / 0.55);
+    if (alpha <= 0.02) return;
+
+    const eyes: Array<{
+      side: -1 | 1;
+      ix: number;
+      iy: number;
+      irx: number;
+      iry: number;
+      pts: ReadonlyArray<readonly [number, number]>;
+    }> = [
+      {
+        side: -1,
+        ix: 84.5,
+        iy: 137.4,
+        irx: 9.7,
+        iry: 10.2,
+        pts: [
+          [69.8, 132.8],
+          [76.0, 128.0],
+          [85.0, 127.4],
+          [93.5, 129.4],
+          [97.2, 134.5],
+          [95.5, 143.5],
+          [89.0, 147.2],
+          [80.0, 147.2],
+          [72.5, 143.8],
+          [69.8, 138.0],
+        ],
+      },
+      {
+        side: 1,
+        ix: 133.5,
+        iy: 137.2,
+        irx: 9.8,
+        iry: 10.2,
+        pts: [
+          [120.8, 134.5],
+          [124.5, 129.2],
+          [133.5, 127.2],
+          [142.5, 128.0],
+          [148.2, 132.8],
+          [148.2, 138.0],
+          [145.5, 143.8],
+          [138.0, 147.2],
+          [129.0, 147.2],
+          [122.5, 143.5],
+        ],
+      },
+    ];
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+
+    for (const e of eyes) {
+      ctx.save();
+      this.traceClosedSpline(ctx, e.pts);
+      ctx.clip();
+
+      // 1) Warm anime sclera + cool-lavender upper-lash cast shadow
+      const scleraGrad = ctx.createLinearGradient(0, 127, 0, 146);
+      scleraGrad.addColorStop(0.0, '#c0b4c8');
+      scleraGrad.addColorStop(0.28, '#e8dce2');
+      scleraGrad.addColorStop(0.58, '#f6ecf0');
+      scleraGrad.addColorStop(1.0, '#faf3f5');
+      ctx.fillStyle = scleraGrad;
+      ctx.fillRect(e.ix - 18, 125, 36, 25);
+
+      // 2) Moving ocean-sapphire iris (matched 1:1 to notail_idle.png)
+      const icx = e.ix + gazeX;
+      const icy = e.iy + gazeY;
+      const irx = e.irx;
+      const iry = e.iry;
+
+      ctx.fillStyle = '#1a2446';
+      ctx.beginPath();
+      ctx.ellipse(icx, icy, irx, iry, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      const irisGrad = ctx.createLinearGradient(icx, icy - iry * 0.92, icx, icy + iry * 0.92);
+      irisGrad.addColorStop(0.0, '#162654');
+      irisGrad.addColorStop(0.36, '#28407c');
+      irisGrad.addColorStop(0.66, '#5898ca');
+      irisGrad.addColorStop(0.88, '#b6e4f6');
+      irisGrad.addColorStop(1.0, '#90b8cc');
+      ctx.fillStyle = irisGrad;
+      ctx.beginPath();
+      ctx.ellipse(icx, icy, irx * 0.91, iry * 0.91, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = 'rgba(164, 226, 248, 0.62)';
+      ctx.beginPath();
+      ctx.ellipse(icx, icy + iry * 0.44, irx * 0.62, iry * 0.30, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Deep central pupil with subtle gaze parallax
+      const pcx = icx + gazeX * 0.22;
+      const pcy = icy + gazeY * 0.22 - 0.4;
+      const prx = irx * 0.42;
+      const pry = iry * 0.46;
+      ctx.fillStyle = 'rgba(10, 30, 74, 0.92)';
+      ctx.beginPath();
+      ctx.ellipse(pcx, pcy, prx, pry, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(4, 18, 52, 0.96)';
+      ctx.beginPath();
+      ctx.ellipse(pcx, pcy, prx * 0.52, pry * 0.52, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Soft upper-lash shadow across top of iris
+      ctx.fillStyle = 'rgba(18, 28, 64, 0.40)';
+      ctx.beginPath();
+      ctx.ellipse(icx, icy - iry * 0.72, irx * 0.95, iry * 0.48, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Glossy starlight catchlights
+      const hlX = icx + (e.side === -1 ? 0.6 : -0.3);
+      const hlY = icy - iry * 0.50;
+      ctx.fillStyle = 'rgba(244, 250, 255, 0.97)';
+      ctx.beginPath();
+      ctx.arc(hlX, hlY, 2.1, 0, Math.PI * 2);
+      ctx.fill();
+
+      const hl2X = icx + (e.side === -1 ? -3.4 : 3.4);
+      const hl2Y = icy + iry * 0.30;
+      ctx.fillStyle = 'rgba(235, 250, 255, 0.78)';
+      ctx.beginPath();
+      ctx.arc(hl2X, hl2Y, 0.85, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+
+    // Re-composite exact center bangs & outer side hair ON TOP of eye sockets!
+    const bangs = this.ensureHairBangsCanvas(idleImg);
+    if (bangs) {
+      ctx.drawImage(bangs, 60, 105);
+    }
+
+    ctx.restore();
+  }
+
+  /** Layer 1 (drawn BEFORE keyboard & mouse): waist-anchored whale tail + BigFish sprite + Live2D eyes + soft blush. */
   public renderBody(ctx: CanvasRenderingContext2D, now: number, layout: DaFeiYuLayout): void {
     const g = this.computeGeom(now, layout);
     const isHappy = !layout.privacyMode && layout.petEnergy > 0.25;
     const isBlinking = now < this.blinkUntil;
+
+    // Draw whale tail behind body sprite & keyboard so its root emerges naturally from her waist
+    // and NEVER floats on top of the keyboard or detaches when shifting left for mouseMode (Fixes #11).
+    const tailRoot = g.spritePointToWorld(0.56, 0.785);
+    const tipX = tailRoot.x + this.tail.relX;
+    const tipY = tailRoot.y + this.tail.relY;
+    this.drawWhaleTail(
+      ctx,
+      tailRoot.x,
+      tailRoot.y,
+      tipX,
+      tipY,
+      this.tail.phase,
+      this.tail.activeWag,
+      layout.logicalW,
+      'back',
+    );
 
     let exprKey: 'idle' | 'blink' | 'shy' | 'happy' = 'idle';
     if (layout.privacyMode) exprKey = 'blink';
@@ -412,6 +790,15 @@ export class DaFeiYuRenderer {
       ctx.rotate(this.bodyTilt);
       ctx.scale(1 + this.bodyBob * 0.022, 1 - this.bodyBob * 0.018);
       ctx.drawImage(img, -g.drawW * 0.5, -g.drawH + g.pivotOff, g.drawW, g.drawH);
+
+      // Live2D eye gaze toward mouse/keyboard when eyes are open
+      if (exprKey === 'idle') {
+        ctx.save();
+        ctx.translate(-g.drawW * 0.5, -g.drawH + g.pivotOff);
+        ctx.scale(g.drawW / 224, g.drawH / 278);
+        this.renderLiveEyes(ctx, this.eyeGazeX, this.eyeGazeY, this.sprites.idle);
+        ctx.restore();
+      }
 
       // Soft natural watercolor cheek blush strictly BELOW her eyes
       if (this.blushLevel > 0.08) {
@@ -459,15 +846,9 @@ export class DaFeiYuRenderer {
     const g = this.computeGeom(now, layout);
     const shL = g.spritePointToWorld(0.39, 0.653);
     const shR = g.spritePointToWorld(0.61, 0.653);
-    const tailRoot = g.spritePointToWorld(0.68, 0.822);
+    const tailRoot = g.spritePointToWorld(0.56, 0.785);
 
     const isHappy = !layout.privacyMode && layout.petEnergy > 0.25;
-    const isTyping =
-      !layout.privacyMode &&
-      (now - this.lastKeyAt < 550 ||
-        this.tail.heldVks.size > 0 ||
-        this.leftHand.heldVks.size > 0 ||
-        this.rightHand.heldVks.size > 0);
     const mouseMode =
       !layout.privacyMode &&
       !isHappy &&
@@ -485,40 +866,23 @@ export class DaFeiYuRenderer {
       ctx.restore();
     }
 
-    // 2) Animated ocean-blue whale tail
-    const wagSpeed = isHappy
-      ? 0.015
-      : this.typingHeat > 0.45
-        ? 0.014
-        : isTyping
-          ? 0.0082
-          : 0.0042;
-    const idleWag = Math.sin(now * wagSpeed) * (isHappy ? 0.34 : 0.16 + this.typingHeat * 0.16);
-    const idleTipX = tailRoot.x + 76 + Math.sin(now * wagSpeed) * 10;
-    const idleTipY = tailRoot.y - 34 + Math.cos(now * wagSpeed * 1.15) * 8;
-
-    const tailAge = Math.max(0, now - this.tail.slapAt);
-    const holdingSlap =
-      !layout.privacyMode &&
-      (this.tail.heldVks.size > 0 || (this.tail.slapAt > 0 && tailAge < 260));
-    let targetPhase = 0;
-    if (holdingSlap) {
-      targetPhase = Math.min(1, tailAge / 65);
-    } else if (!layout.privacyMode && this.tail.slapAt > 0) {
-      const holdEnd = Math.max(this.tail.slapAt + 260, this.tail.releaseAt);
-      const retElapsed = Math.max(0, now - holdEnd);
-      targetPhase = Math.max(0, 1 - retElapsed / 220);
+    // 2) Only draw the arching front half & fluke of the whale tail in foreground while slapping a key,
+    // keeping the waist root strictly behind her body & keyboard bezel!
+    if (this.tail.phase > 0.12) {
+      const tipX = tailRoot.x + this.tail.relX;
+      const tipY = tailRoot.y + this.tail.relY;
+      this.drawWhaleTail(
+        ctx,
+        tailRoot.x,
+        tailRoot.y,
+        tipX,
+        tipY,
+        this.tail.phase,
+        this.tail.activeWag,
+        layout.logicalW,
+        'front',
+      );
     }
-    this.tail.phase += (targetPhase - this.tail.phase) * (1 - Math.exp(-34 * dt));
-    this.tail.tx = idleTipX + (this.tail.slapTargetX - idleTipX) * this.tail.phase;
-    this.tail.ty = idleTipY + (this.tail.slapTargetY - idleTipY) * this.tail.phase;
-    const tLerp = 1 - Math.exp(-36 * dt);
-    this.tail.x += (this.tail.tx - this.tail.x) * tLerp;
-    this.tail.y += (this.tail.ty - this.tail.y) * tLerp;
-    this.tail.squash *= Math.exp(-11 * dt);
-
-    const activeWag = idleWag * (1 - this.tail.phase) + -0.08 * this.tail.phase;
-    this.drawWhaleTail(ctx, tailRoot.x, tailRoot.y, this.tail.x, this.tail.y, this.tail.phase, activeWag, layout.logicalW);
 
     // 3) Pure round chibi hands (covering closed eyes in privacyMode!)
     const leftUsingPointer = mouseMode && !layout.pointerOnRight;
@@ -623,11 +987,19 @@ export class DaFeiYuRenderer {
     slapPhase: number,
     wagAngle: number,
     logicalW: number,
+    layer: 'back' | 'front',
   ): void {
-    const idleCtrlX = rootX + 48;
-    const idleCtrlY = rootY - 2;
-    const slapCtrlX = Math.min(logicalW - 18, Math.max(rootX + 94, tipX + 42));
-    const slapCtrlY = Math.min(rootY - 28, (rootY + tipY) * 0.5 - 50);
+    const idleCtrlX = rootX + 52;
+    const idleCtrlY = rootY - 6;
+    // Smoothly wrap around the right hip and sweep over the keyboard deck when slapping far-left keys
+    // so the whale tail never cuts across her torso or face!
+    const crossLeft = Math.max(0, Math.min(1, (rootX + 24 - tipX) / 145));
+    const nearSlapCtrlX = Math.min(logicalW - 18, Math.max(rootX + 94, tipX + 42));
+    const nearSlapCtrlY = Math.min(rootY - 42, (rootY + tipY) * 0.5 - 64);
+    const farSlapCtrlX = Math.min(logicalW - 16, rootX + 104);
+    const farSlapCtrlY = Math.max(rootY + 28, tipY - 14);
+    const slapCtrlX = nearSlapCtrlX + (farSlapCtrlX - nearSlapCtrlX) * crossLeft;
+    const slapCtrlY = nearSlapCtrlY + (farSlapCtrlY - nearSlapCtrlY) * crossLeft;
 
     const ctrlX = idleCtrlX + (slapCtrlX - idleCtrlX) * slapPhase;
     const ctrlY = idleCtrlY + (slapCtrlY - idleCtrlY) * slapPhase;
@@ -648,13 +1020,15 @@ export class DaFeiYuRenderer {
       pts.push({ x, y, nx, ny, r });
     }
 
+    const startIdx = layer === 'front' ? Math.floor(steps * 0.42) : 0;
+    const drawFluke = layer === 'front' ? true : slapPhase <= 0.12;
     const tipAng = Math.atan2(tipY - ctrlY, tipX - ctrlX) + wagAngle;
 
     ctx.save();
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
-    if (slapPhase > 0.25) {
+    if (layer === 'front' && slapPhase > 0.25) {
       ctx.save();
       ctx.shadowColor = 'rgba(7, 16, 40, 0.45)';
       ctx.shadowBlur = 10;
@@ -673,46 +1047,56 @@ export class DaFeiYuRenderer {
     stemGrad.addColorStop(1, '#52b2eb');
 
     ctx.beginPath();
-    ctx.moveTo(pts[0].x + pts[0].nx * pts[0].r, pts[0].y + pts[0].ny * pts[0].r);
-    for (let i = 1; i < pts.length; i++) {
+    ctx.moveTo(
+      pts[startIdx].x + pts[startIdx].nx * pts[startIdx].r,
+      pts[startIdx].y + pts[startIdx].ny * pts[startIdx].r,
+    );
+    for (let i = startIdx + 1; i < pts.length; i++) {
       ctx.lineTo(pts[i].x + pts[i].nx * pts[i].r, pts[i].y + pts[i].ny * pts[i].r);
     }
-    for (let i = pts.length - 1; i >= 0; i--) {
+    for (let i = pts.length - 1; i >= startIdx; i--) {
       ctx.lineTo(pts[i].x - pts[i].nx * pts[i].r, pts[i].y - pts[i].ny * pts[i].r);
     }
     ctx.closePath();
     ctx.fillStyle = stemGrad;
     ctx.fill();
 
+    const edgeStart = Math.max(1, startIdx);
     ctx.strokeStyle = '#16203d';
     ctx.lineWidth = 2.4;
     ctx.beginPath();
-    for (let i = 1; i < pts.length; i++) {
+    for (let i = edgeStart; i < pts.length; i++) {
       const px = pts[i].x + pts[i].nx * pts[i].r;
       const py = pts[i].y + pts[i].ny * pts[i].r;
-      if (i === 1) ctx.moveTo(px, py);
+      if (i === edgeStart) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
     }
     ctx.stroke();
     ctx.beginPath();
-    for (let i = 1; i < pts.length; i++) {
+    for (let i = edgeStart; i < pts.length; i++) {
       const px = pts[i].x - pts[i].nx * pts[i].r;
       const py = pts[i].y - pts[i].ny * pts[i].r;
-      if (i === 1) ctx.moveTo(px, py);
+      if (i === edgeStart) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
     }
     ctx.stroke();
 
+    const hlStart = Math.max(2, startIdx);
     ctx.strokeStyle = 'rgba(170, 232, 255, 0.48)';
     ctx.lineWidth = 3.0;
     ctx.beginPath();
-    for (let i = 2; i < pts.length; i++) {
+    for (let i = hlStart; i < pts.length; i++) {
       const hx = pts[i].x + pts[i].nx * (pts[i].r * 0.35);
       const hy = pts[i].y + pts[i].ny * (pts[i].r * 0.35);
-      if (i === 2) ctx.moveTo(hx, hy);
+      if (i === hlStart) ctx.moveTo(hx, hy);
       else ctx.lineTo(hx, hy);
     }
     ctx.stroke();
+
+    if (!drawFluke) {
+      ctx.restore();
+      return;
+    }
 
     ctx.save();
     ctx.translate(tipX, tipY);

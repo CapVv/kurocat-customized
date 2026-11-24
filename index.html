@@ -15,6 +15,19 @@
       <button class="update-toast-close" id="btn-toast-close" type="button" title="稍后提醒">×</button>
     </div>
 
+    <div id="tail-picker-bar" class="tail-picker-bar hidden" role="dialog" aria-label="自定义尾巴按键">
+      <div class="tail-picker-top">
+        <span class="tail-picker-title" id="tail-picker-title">🐾 点键帽或敲键盘开关（已选 4 键）</span>
+        <button class="tail-picker-done" id="btn-tail-done" type="button">完成</button>
+      </div>
+      <div class="tail-picker-actions">
+        <button class="tail-preset-btn" data-tailpreset="office" type="button">回车空格</button>
+        <button class="tail-preset-btn" data-tailpreset="rightFn" type="button">方向/小键盘</button>
+        <button class="tail-preset-btn" data-tailpreset="edgeMods" type="button">外侧功能键</button>
+        <button class="tail-preset-btn danger" data-tailpreset="clear" type="button">清空</button>
+      </div>
+    </div>
+
     <div id="context-menu" class="context-menu hidden">
       <div class="menu-header" id="menu-header">🐈‍⬛ KuroCat 小黑猫</div>
       <div class="menu-scale-row">
@@ -80,6 +93,23 @@
       </div>
       <div class="menu-scale-row">
         <div class="scale-header">
+          <span class="menu-scale-label">尾巴拍键模式</span>
+          <span class="tail-mode-badge" id="tail-mode-badge">黑猫固定 11 键</span>
+        </div>
+        <div class="tail-mode-pills">
+          <button class="kb-pill active" data-tailmode="fixed" type="button" title="黑猫固定用尾巴按空格、回车、方向键、Esc、PgUp、PgDn、Del、Ins">固定</button>
+          <button class="kb-pill" data-tailmode="smart" title="平时双手打字，两手忙不过来或敲完回车时自动出尾">智能</button>
+          <button class="kb-pill" data-tailmode="custom" title="只拍你亲手勾选的按键">自定义</button>
+          <button class="kb-pill" data-tailmode="edge" title="近尾外侧边缘区（不拆 WASD）">边缘</button>
+          <button class="kb-pill" data-tailmode="off" title="尾巴只自然摆动，不拍任何键">关闭</button>
+        </div>
+        <button class="tail-pick-trigger" data-action="open-tail-picker" id="btn-open-tail-picker" type="button">
+          <span>🐾 在键盘上点选尾巴按键</span>
+          <span class="menu-hint" id="tail-keys-count">4 键</span>
+        </button>
+      </div>
+      <div class="menu-scale-row">
+        <div class="scale-header">
           <span class="menu-scale-label">尺寸缩放</span>
           <button class="scale-value-btn" id="scale-value" type="button" title="点击复位 100%">100%</button>
         </div>
@@ -110,7 +140,7 @@
       </button>
       <button class="menu-item" data-action="check-update" id="btn-check-update">
         <span>检查更新</span>
-        <span class="menu-hint" id="update-hint">v4.7.0</span>
+        <span class="menu-hint" id="update-hint">v4.9.1</span>
       </button>
       <button class="menu-item danger" data-action="quit">
         <span>退出 KuroCat</span>

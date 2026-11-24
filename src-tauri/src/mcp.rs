@@ -143,7 +143,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "update_settings",
-            "description": "Update KuroCat desktop pet settings live (scale 0.2-1.5, showKeyBubbles, soundEnabled, alwaysOnTop, clickThroughLocked, catBreed, keyboardLayout 65|108, keyboardOrientation cat|viewer, autostart).",
+            "description": "Update KuroCat desktop pet settings live (scale 0.2-1.5, showKeyBubbles, soundEnabled, alwaysOnTop, clickThroughLocked, catBreed, keyboardLayout 65|108, keyboardOrientation cat|viewer, tailKeyMode smart|custom|edge|off, tailKeyIds string[], autostart).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -151,6 +151,12 @@ fn tool_definitions() -> Value {
                     "scale": { "type": "number", "minimum": 0.2, "maximum": 1.5 },
                     "keyboardLayout": { "type": "string", "enum": ["65", "108"] },
                     "keyboardOrientation": { "type": "string", "enum": ["cat", "viewer"] },
+                    "tailKeyMode": { "type": "string", "enum": ["smart", "custom", "edge", "off"] },
+                    "tailKeyIds": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Logical key IDs tapped by the tail when tailKeyMode is 'custom' (e.g. ['enter', 'space', 'bs', 'esc', 'r', 'tab', 'up', 'down', 'left', 'right', 'np_0'])."
+                    },
                     "showKeyBubbles": { "type": "boolean" },
                     "soundEnabled": { "type": "boolean" },
                     "alwaysOnTop": { "type": "boolean" },
@@ -284,6 +290,16 @@ fn execute_tool(name: &str, args: &Value, on_change: &dyn Fn()) -> Value {
             }
             if let Some(orient) = args.get("keyboardOrientation").and_then(|v| v.as_str()) {
                 s.keyboard_orientation = crate::config::normalize_keyboard_orientation(orient);
+            }
+            if let Some(mode) = args.get("tailKeyMode").and_then(|v| v.as_str()) {
+                s.tail_key_mode = crate::config::normalize_tail_key_mode(mode);
+            }
+            if let Some(arr) = args.get("tailKeyIds").and_then(|v| v.as_array()) {
+                let raw: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                s.tail_key_ids = crate::config::normalize_tail_key_ids(&raw);
             }
             if let Some(b) = args.get("showKeyBubbles").and_then(|v| v.as_bool()) {
                 s.show_key_bubbles = b;
