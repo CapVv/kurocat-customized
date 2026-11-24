@@ -647,16 +647,6 @@ async fn check_for_update() -> Result<updater::UpdateInfo, String> {
 }
 
 #[tauri::command]
-async fn install_update(app: AppHandle, info: updater::UpdateInfo) -> Result<(), String> {
-    if config::DESK_PREVIEW {
-        return Err("键盘与触控板试用版不安装更新".to_string());
-    }
-    tauri::async_runtime::spawn_blocking(move || updater::perform_update_install(&app, info))
-        .await
-        .map_err(|e| format!("安装更新任务异常: {}", e))?
-}
-
-#[tauri::command]
 fn open_release_page(url: String) {
     updater::open_url_in_browser(&url);
 }
@@ -2148,7 +2138,6 @@ pub fn run() {
             reset_position,
             create_desktop_shortcut,
             check_for_update,
-            install_update,
             open_release_page,
             quit_app,
         ])

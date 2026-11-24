@@ -59,11 +59,6 @@ interface UpdateInfo {
   latestVersion: string;
   hasUpdate: boolean;
   releaseUrl: string;
-  assetName: string | null;
-  downloadUrl: string | null;
-  assetSha256: string | null;
-  assetSize: number | null;
-  installKind: string;
   notesSummary: string;
 }
 
@@ -120,7 +115,6 @@ const scaleSliderEl = document.getElementById('scale-slider') as HTMLInputElemen
 const scaleValueEl = document.getElementById('scale-value') as HTMLButtonElement;
 const updateToastEl = document.getElementById('update-toast') as HTMLDivElement;
 const updateToastTextEl = document.getElementById('update-toast-text') as HTMLSpanElement;
-const btnToastInstallEl = document.getElementById('btn-toast-install') as HTMLButtonElement;
 const btnToastOpenEl = document.getElementById('btn-toast-open') as HTMLButtonElement;
 const btnToastCloseEl = document.getElementById('btn-toast-close') as HTMLButtonElement;
 const tailPickerBarEl = document.getElementById('tail-picker-bar') as HTMLDivElement;
@@ -409,15 +403,13 @@ function hideUpdateToast(): void {
 
 function showUpdateToast(
   text: string,
-  options: { showInstall?: boolean; showOpen?: boolean; autoHideMs?: number; busy?: boolean } = {},
+  options: { showOpen?: boolean; autoHideMs?: number } = {},
 ): void {
   if (toastAutoHideTimer !== null) {
     window.clearTimeout(toastAutoHideTimer);
     toastAutoHideTimer = null;
   }
   updateToastTextEl.textContent = text;
-  btnToastInstallEl.classList.toggle('hidden', !options.showInstall);
-  btnToastInstallEl.disabled = Boolean(options.busy);
   btnToastOpenEl.classList.toggle('hidden', !options.showOpen);
   updateToastEl.classList.remove('hidden');
   void invoke('set_update_banner_open', { open: true });
@@ -440,7 +432,7 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
     case 'checking':
       updateBusy = true;
       setUpdateHint('检测中...');
-      showUpdateToast('🔍 正在检查新版本...', { busy: true });
+      showUpdateToast('🔍 正在检查新版本...');
       break;
     case 'available':
       updateBusy = false;
@@ -449,8 +441,7 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
         setUpdateHint(`⬆ v${ver}`, 'ready');
         if (fromManual || dismissedVersion !== ver) {
           showUpdateToast(`✨ 发现新版本 v${ver}`, {
-            showInstall: Boolean(latestUpdateInfo.downloadUrl),
-            showOpen: !latestUpdateInfo.downloadUrl,
+            showOpen: true,
           });
         }
       }
@@ -459,13 +450,6 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
       updateBusy = false;
       setUpdateHint(`✓ v${appVersion}`);
       showUpdateToast(`✓ 已是最新版本 v${appVersion}`, { autoHideMs: 2600 });
-      break;
-    case 'downloading':
-    case 'verifying':
-    case 'installing':
-      updateBusy = true;
-      setUpdateHint('更新中...', 'ready');
-      showUpdateToast(`⏳ ${ev.message}`, { busy: true });
       break;
     case 'error':
       updateBusy = false;
@@ -478,33 +462,12 @@ function handleUpdateProgressEvent(ev: UpdateProgressEvent, fromManual = false):
   }
 }
 
-async function triggerInstallUpdate(): Promise<void> {
-  if (updateBusy || !latestUpdateInfo || !latestUpdateInfo.hasUpdate) return;
-  updateBusy = true;
-  closeContextMenu();
-  showUpdateToast(`⏳ 正在下载 v${latestUpdateInfo.latestVersion}...`, { busy: true });
-  setUpdateHint('下载中...', 'ready');
-  try {
-    await invoke('install_update', { info: latestUpdateInfo });
-  } catch (err) {
-    updateBusy = false;
-    const msg = typeof err === 'string' ? err : String(err);
-    setUpdateHint('更新失败', 'error');
-    showUpdateToast(`⚠ ${msg}`, { showOpen: true, autoHideMs: 6500 });
-  }
-}
-
 async function triggerManualUpdateCheck(): Promise<void> {
   if (updateBusy) return;
-  // If we already know an update is ready, clicking the menu item immediately starts installing it!
-  if (latestUpdateInfo?.hasUpdate && latestUpdateInfo.downloadUrl) {
-    await triggerInstallUpdate();
-    return;
-  }
   updateBusy = true;
   setUpdateHint('检测中...');
   closeContextMenu();
-  showUpdateToast('🔍 正在检查新版本...', { busy: true });
+  showUpdateToast('🔍 正在检查新版本...');
   try {
     const info = await invoke<UpdateInfo>('check_for_update');
     handleUpdateProgressEvent(
@@ -558,11 +521,6 @@ async function bootstrap(): Promise<void> {
 
   await listen<UpdateProgressEvent>('kuro-update-status', (ev) => {
     handleUpdateProgressEvent(ev.payload, false);
-  });
-
-  btnToastInstallEl.addEventListener('click', (e) => {
-    e.stopPropagation();
-    void triggerInstallUpdate();
   });
 
   btnToastOpenEl.addEventListener('click', (e) => {

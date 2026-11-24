@@ -33,11 +33,6 @@ interface UpdateInfo {
   latestVersion: string;
   hasUpdate: boolean;
   releaseUrl: string;
-  assetName: string | null;
-  downloadUrl: string | null;
-  assetSha256: string | null;
-  assetSize: number | null;
-  installKind: string;
   notesSummary: string;
 }
 
@@ -73,6 +68,8 @@ let settings: AppSettings = {
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
 let sliderDragging = false;
 let currentAppVersion = '4.9.1';
+let upstreamReleaseUrl: string | null = null;
+const releaseButton = document.getElementById('btn-open-upstream-release') as HTMLButtonElement;
 
 const menuEl = document.getElementById('context-menu') as HTMLDivElement;
 const breedPillsEl = document.getElementById('breed-pills') as HTMLDivElement;
@@ -274,6 +271,8 @@ async function createDesktopShortcut(): Promise<void> {
 async function triggerManualUpdateCheck(): Promise<void> {
   const hint = document.getElementById('update-hint');
   if (hint) hint.textContent = '检查中…';
+  upstreamReleaseUrl = null;
+  releaseButton.classList.add('hidden');
   try {
     const info = await invoke<UpdateInfo>('check_for_update');
     if (info.hasUpdate) {
@@ -281,9 +280,8 @@ async function triggerManualUpdateCheck(): Promise<void> {
         hint.textContent = `发现 v${info.latestVersion}`;
         hint.classList.add('copied');
       }
-      if (info.releaseUrl) {
-        void invoke('open_release_page', { url: info.releaseUrl });
-      }
+      upstreamReleaseUrl = info.releaseUrl;
+      releaseButton.classList.toggle('hidden', !upstreamReleaseUrl);
     } else if (hint) {
       hint.textContent = `最新 v${info.currentVersion}`;
       setTimeout(() => {
@@ -455,6 +453,9 @@ async function bootstrap(): Promise<void> {
       case 'reset-pos':
         void invoke('reset_position');
         closeMenu();
+        break;
+      case 'open-upstream-release':
+        if (upstreamReleaseUrl) void invoke('open_release_page', { url: upstreamReleaseUrl });
         break;
       case 'check-update':
         void triggerManualUpdateCheck();
