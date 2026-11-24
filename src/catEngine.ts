@@ -10,11 +10,27 @@ import {
 import { catAudio } from './audio';
 import { resolveCustomSkin, type CatSkinConfig, type ResolvedSkin } from './catSkins';
 import { DaFeiYuRenderer, type DaFeiYuLayout } from './dafeiyuRenderer';
+import {
+  DESK_KEYBOARD_WIDTH, DESK_KEYBOARD_DEPTH, DESK_TRACKPAD_SLOT_WIDTH, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH,
+  DESK_DEVICE_GAP, DESK_CENTER_Y, DESK_KEYS_SIDE_INSET, DESK_KEYS_TOP_INSET, DESK_KEYS_BOTTOM_INSET,
+  LOW_PROFILE_LAYOUT, projectDeskPoint, resolveLowProfileKey, traceDeskRect,
+} from './deskLayout';
 
 export const LOGICAL_W = 420;
 export const LOGICAL_H = 440;
+const TRACKPAD_GLIDE_IDLE_MS = 170;
+const TRACKPAD_PAW_DWELL_MS = 2200;
+const VIEWER_DEVICE_GAP = 10;
+const VIEWER_MOUSE_TRAVEL_X = 6;
+const VIEWER_MOUSE_TRAVEL_Y = 5;
+const TRACKPAD_REAR_HALF_WIDTH = 27;
+const TRACKPAD_FRONT_HALF_WIDTH = 29;
+const MOUSE_HALF_WIDTH = 18.5;
+const TRACKPAD_LEFT_COLOR = '#d4f044';
+const TRACKPAD_RIGHT_COLOR = '#ff7b3b';
 export type CatBreed = 'black' | 'ragdoll' | 'dafeiyu';
 export type KeyboardOrientation = 'cat' | 'viewer';
+export type PointerDevice = 'mouse' | 'trackpad';
 export type TailKeyMode = 'smart' | 'custom' | 'edge' | 'off';
 
 export const DEFAULT_TAIL_KEY_IDS: readonly string[] = ['enter', 'space', 'bs', 'esc'];
@@ -283,7 +299,7 @@ export class KuroCatEngine {
   }
 
   public previewTailTap(specId: string): void {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const spec = layout.keys.find((k) => k.id === specId);
     if (!spec) return;
     const now = performance.now();
@@ -295,7 +311,7 @@ export class KuroCatEngine {
     }
     const targetPt = this.getTailTargetPoint(spec);
     if (this.catBreed === 'dafeiyu') {
-      this.dafeiyu.triggerTailPreview(targetPt, this.buildDaFeiYuLayout());
+      this.dafeiyu.triggerTailPreview(targetPt, this.buildDaFeiYuLayout(now));
       return;
     }
     if (!this.catTail.active && this.catTail.reach < 0.08) {
@@ -355,6 +371,20 @@ export class KuroCatEngine {
     const lx = (canvasX - offsetX) / uniformScale;
     const ly = (canvasY - offsetY) / uniformScale;
 
+    if (this.usesLowProfileDesk) {
+      const { left, top, unitWidth, rowHeight } = this.lowProfileKeyBounds();
+      const { totalUnits, totalRows, keys } = LOW_PROFILE_LAYOUT;
+      const y = ly + this.lowProfileKeyBedLift() + 1.65;
+      const innerLeft = this.projectDesk(left, y).x;
+      const innerRight = this.projectDesk(left + totalUnits * unitWidth, y).x;
+      const screenU = (lx - innerLeft) * totalUnits / (innerRight - innerLeft);
+      const screenRow = (y - top) / rowHeight;
+      const viewer = this.keyboardOrientation === 'viewer';
+      const u = viewer ? screenU : totalUnits - screenU;
+      const row = Math.floor(viewer ? screenRow : totalRows - screenRow);
+      return keys.find((key) => key.row === row && u >= key.uStart && u < key.uStart + key.uWidth) ?? null;
+    }
+
     const dx = lx - this.kbCenterX;
     const dy = ly - (this.kbCenterY + this.kbBounce * 1.1 + this.deskHopY);
     const cos = Math.cos(-this.kbTiltRad);
@@ -373,7 +403,7 @@ export class KuroCatEngine {
       return null;
     }
 
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const is108 = this.keyboardLayout === '108';
     const rowH = innerH / layout.totalRows;
@@ -494,6 +524,58 @@ export class KuroCatEngine {
       this.mouseBaseX = isBigFish ? 72 : 46;
       this.mouseBaseY = isBigFish ? 322 : 338;
     }
+
+    if (this.usesLowProfileDesk) {
+      this.layoutLowProfileDesk();
+    } else if (this.personalDesk && this.keyboardOrientation === 'viewer') {
+      this.kbCenterX = this.logicalW - this.kbCenterX;
+      const clearance = this.pointerDevice === 'trackpad'
+        ? TRACKPAD_FRONT_HALF_WIDTH
+        : MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X;
+      const alongKeyboard = this.kbWidth * 0.5 + VIEWER_DEVICE_GAP + clearance;
+      this.mouseBaseX = this.kbCenterX + alongKeyboard * Math.cos(this.kbTiltRad);
+      this.mouseBaseY = this.kbCenterY + alongKeyboard * Math.sin(this.kbTiltRad);
+    }
+  }
+
+  private layoutLowProfileDesk(): void {
+    const direction = this.keyboardOrientation === 'viewer' ? 1 : -1;
+    const trackpad = this.pointerDevice === 'trackpad';
+    const deviceSlotWidth = trackpad ? DESK_TRACKPAD_SLOT_WIDTH : (MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X) * 2;
+    const deviceWidth = trackpad ? DESK_TRACKPAD_WIDTH : deviceSlotWidth;
+    this.kbWidth = DESK_KEYBOARD_WIDTH;
+    this.kbHeight = DESK_KEYBOARD_DEPTH;
+    this.kbCenterY = DESK_CENTER_Y;
+    this.kbTiltRad = 0;
+    this.kbCenterX = this.logicalW / 2 - direction * (DESK_DEVICE_GAP + deviceSlotWidth) / 2;
+    const catOffset = trackpad && direction === 1 ? 28 : 12;
+    this.catCenterX = this.kbCenterX + direction * catOffset;
+    this.mouseBaseX = this.kbCenterX + direction * (this.kbWidth / 2 + DESK_DEVICE_GAP + deviceWidth / 2);
+    const deviceDepth = trackpad ? DESK_TRACKPAD_DEPTH : 48;
+    this.mouseBaseY = this.kbCenterY + (this.kbHeight - deviceDepth) / 2;
+  }
+
+  private get usesLowProfileDesk(): boolean {
+    return this.personalDesk && this.keyboardLayout === '65';
+  }
+
+  private get currentLayout() {
+    return this.usesLowProfileDesk ? LOW_PROFILE_LAYOUT : getKeyboardLayout(this.keyboardLayout);
+  }
+
+  private resolveKey(vk: number): KeySpec | null {
+    return this.usesLowProfileDesk ? resolveLowProfileKey(vk) : resolveKeyByVk(vk, this.keyboardLayout);
+  }
+
+  private projectDesk(x: number, y: number): Vec2 {
+    return projectDeskPoint(x, y, this.logicalW / 2);
+  }
+
+  private getTrackpadContactWorld(): Vec2 {
+    const contact = this.getTrackpadContact();
+    const x = this.mouseBaseX + contact.x;
+    const y = this.mouseBaseY + contact.y;
+    return this.usesLowProfileDesk ? this.projectDesk(x, y) : { x, y };
   }
 
   public setCatAppearance(breedId: string, skin?: CatSkinConfig | null): void {
@@ -519,24 +601,69 @@ export class KuroCatEngine {
     const nextLayout: KeyboardLayoutId = layout === '108' ? '108' : '65';
     const nextOrientation: KeyboardOrientation = orientation === 'viewer' ? 'viewer' : 'cat';
     const layoutChanged = this.keyboardLayout !== nextLayout;
+    if (layoutChanged || this.keyboardOrientation !== nextOrientation) {
+      this.heldKeys.clear();
+      this.catTail.active = false;
+      this.catTail.heldVks.clear();
+      this.catTailHeldAt.clear();
+    }
+    if (this.keyboardOrientation !== nextOrientation) {
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        if (paw.mode === 'mouse') paw.mode = 'idle';
+      }
+      this.mouseBadges = [];
+    }
     this.keyboardLayout = nextLayout;
     this.keyboardOrientation = nextOrientation;
 
     this.syncLayoutPositions();
 
     if (layoutChanged) {
-      this.heldKeys.clear();
-      this.catTail.heldVks.clear();
-      this.catTailHeldAt.clear();
-      this.leftPaw.pos = { x: this.catCenterX - 18, y: this.catBaseY };
-      this.leftPaw.target = { x: this.catCenterX - 18, y: this.catBaseY };
-      this.rightPaw.pos = { x: this.catCenterX + 18, y: this.catBaseY };
-      this.rightPaw.target = { x: this.catCenterX + 18, y: this.catBaseY };
+      for (const paw of [this.leftPaw, this.rightPaw]) {
+        paw.mode = 'idle';
+      }
     }
     this.wakeRendering();
   }
 
-  private buildDaFeiYuLayout(): DaFeiYuLayout {
+  public setPointerDevice(device: PointerDevice): void {
+    if (device === this.pointerDevice) return;
+    this.pointerDevice = device;
+    this.wakeRendering();
+    this.syncLayoutPositions();
+    this.mouseBadges = [];
+    this.trackpadContact = { x: 0, y: 0 };
+    this.trackpadContactTarget = { x: 0, y: 0 };
+    if (device === 'mouse' && this.keyboardPaw.mode === 'mouse') {
+      this.keyboardPaw.mode = 'idle';
+    }
+  }
+
+  private get pointerOnRight(): boolean {
+    return this.personalDesk && this.keyboardOrientation === 'viewer';
+  }
+
+  private get pointerPaw(): PawState {
+    return this.pointerOnRight ? this.rightPaw : this.leftPaw;
+  }
+
+  private get keyboardPaw(): PawState {
+    return this.pointerOnRight ? this.leftPaw : this.rightPaw;
+  }
+
+  private getTrackpadContact(): Vec2 {
+    return {
+      x: this.trackpadContact.x,
+      y: Math.max(-10, Math.min(10, this.trackpadContact.y + this.trackpadScrollOffset)),
+    };
+  }
+
+  private isTrackpadActive(now: number, idleMs = TRACKPAD_PAW_DWELL_MS): boolean {
+    return this.mouseLeftDown || this.mouseRightDown || this.mouseMiddleDown ||
+      now - this.lastMouseMoveAt < idleMs;
+  }
+
+  private buildDaFeiYuLayout(now: number): DaFeiYuLayout {
     const mx = this.mouseBaseX + this.mouseOffsetX;
     const my = this.mouseBaseY + this.mouseOffsetY;
     const isCatFacing = this.keyboardOrientation === 'cat';
@@ -545,19 +672,28 @@ export class KuroCatEngine {
     const ang = this.kbTiltRad + (isCatFacing ? Math.PI : 0);
     const c = Math.cos(ang);
     const s = Math.sin(ang);
+    const contact = this.getTrackpadContactWorld();
     return {
+      charX: this.usesLowProfileDesk ? this.catCenterX - 4 : this.keyboardLayout === '108' ? 268 : 192,
       logicalW: this.logicalW,
       kbCenterX: this.kbCenterX,
       kbCenterY: this.kbCenterY,
       kbWidth: this.kbWidth,
       kbHeight: this.kbHeight,
       kbTiltRad: this.kbTiltRad,
-      mouseBtnX: mx + localBtnX * c - localBtnY * s,
-      mouseBtnY: my + localBtnX * s + localBtnY * c,
+      mouseBtnX: this.pointerDevice === 'trackpad'
+        ? contact.x
+        : mx + localBtnX * c - localBtnY * s,
+      mouseBtnY: this.pointerDevice === 'trackpad'
+        ? contact.y
+        : my + localBtnX * s + localBtnY * c,
       mouseNX: this.lastMouseNX,
+      pointerOnRight: this.pointerOnRight,
       mouseLeft: this.mouseLeftDown,
       mouseRight: this.mouseRightDown,
-      mouseActiveAt: this.lastMouseMoveAt,
+      mouseActive: this.pointerDevice === 'trackpad'
+        ? this.isTrackpadActive(now)
+        : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 900,
       mouseClickAt: this.lastMouseClickAt,
       petEnergy: this.petEnergy,
       privacyMode: this.privacyMode,
@@ -581,7 +717,12 @@ export class KuroCatEngine {
   private kbHeight = 74;
   private kbTiltRad = (3.4 * Math.PI) / 180;
 
-  // True-scale white oval mouse to the left of keyboard
+  // Position and animation for the mouse or trackpad
+  private pointerDevice: PointerDevice = 'mouse';
+  private trackpadContact: Vec2 = { x: 0, y: 0 };
+  private trackpadContactTarget: Vec2 = { x: 0, y: 0 };
+  private trackpadScrollDirection = 1;
+  private trackpadScrollOffset = 0;
   private mouseBaseX = 46;
   private mouseBaseY = 338;
   private mouseOffsetX = 0;
@@ -713,14 +854,18 @@ export class KuroCatEngine {
   private bubbles: KeyBubble[] = [];
   private nextBubbleId = 1;
 
-  constructor(canvas: HTMLCanvasElement, options?: { embedded?: boolean }) {
+  private readonly personalDesk: boolean;
+
+  constructor(canvas: HTMLCanvasElement, options?: { embedded?: boolean; personalDesk?: boolean }) {
     this.canvas = canvas;
     this.embedded = Boolean(options?.embedded);
+    this.personalDesk = Boolean(options?.personalDesk);
+    this.syncLayoutPositions();
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Could not initialize 2D canvas context');
     this.ctx = ctx;
 
-    for (const k of KEYBOARD_KEYS_65) {
+    for (const k of this.personalDesk ? LOW_PROFILE_LAYOUT.keys : KEYBOARD_KEYS_65) {
       this.keyAnims.set(k.id, { pressed: false, pressAmount: 0, lastHitAt: -10000 });
     }
     for (const k of KEYBOARD_KEYS_108) {
@@ -945,7 +1090,7 @@ export class KuroCatEngine {
       return;
     }
     const now = performance.now();
-    const spec = resolveKeyByVk(vk, this.keyboardLayout);
+    const spec = this.resolveKey(vk);
     if (!spec) return;
     this.wakeCat(now);
 
@@ -985,17 +1130,15 @@ export class KuroCatEngine {
     this.kbBounce = Math.min(1, this.kbBounce + 0.45);
     this.squashSpring.kick(1.85);
 
-    const activelyMousing =
-      this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 320;
+    const activelyMousing = this.pointerDevice === 'trackpad'
+      ? this.isTrackpadActive(now, 320)
+      : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 320;
     const rawKeyPt = this.getKeyWorldCenter(spec);
     const useTail = this.shouldUseTailForKey(spec, rawKeyPt, activelyMousing, prevAnyKeyAt, now);
 
     if (this.catBreed === 'dafeiyu') {
-      const dafeiyuLayout = this.buildDaFeiYuLayout();
-      const dafeiyuMouseBusy =
-        dafeiyuLayout.mouseLeft ||
-        dafeiyuLayout.mouseRight ||
-        now - dafeiyuLayout.mouseActiveAt < 900;
+      const dafeiyuLayout = this.buildDaFeiYuLayout(now);
+      const dafeiyuMouseBusy = dafeiyuLayout.mouseActive;
       const dafeiyuUseTail =
         useTail ||
         this.shouldUseTailForKey(spec, rawKeyPt, dafeiyuMouseBusy, prevAnyKeyAt, now);
@@ -1015,7 +1158,7 @@ export class KuroCatEngine {
       else this.earTwitchRight = 1;
     }
 
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const keyColCenter = spec.uStart + spec.uWidth * 0.5;
     const screenKeyCol = isCatFacing ? layout.totalUnits - keyColCenter : keyColCenter;
@@ -1071,7 +1214,7 @@ export class KuroCatEngine {
 
     if (spec.id === 'space') {
       if (activelyMousing) {
-        chosen = this.rightPaw;
+        chosen = this.keyboardPaw;
       } else {
         this.lastSpacePaw = this.lastSpacePaw === 'left' ? 'right' : 'left';
         chosen = this.lastSpacePaw === 'left' ? this.leftPaw : this.rightPaw;
@@ -1086,7 +1229,7 @@ export class KuroCatEngine {
       const rY = spec.rowY ?? spec.row;
       targetPoint = this.projectKeyboardPoint(spaceU, rY + 0.50);
     } else if (activelyMousing) {
-      chosen = this.rightPaw;
+      chosen = this.keyboardPaw;
     } else if (screenKeyCol < splitCol) {
       chosen = this.leftPaw;
     } else {
@@ -1157,7 +1300,7 @@ export class KuroCatEngine {
       }
     }
     if (this.privacyMode) return;
-    const spec = resolveKeyByVk(vk, this.keyboardLayout);
+    const spec = this.resolveKey(vk);
     if (!spec) return;
     this.wakeRendering();
     let stillHeldSameSpec = false;
@@ -1176,12 +1319,22 @@ export class KuroCatEngine {
   public onGlobalMouseMove(nx: number, ny: number): void {
     const now = performance.now();
     const moveDelta = Math.hypot(nx - this.lastMouseNX, ny - this.lastMouseNY);
+    if (this.pointerDevice === 'trackpad') {
+      if (nx === this.lastMouseNX && ny === this.lastMouseNY) return;
+      if (now - this.lastMouseMoveAt >= TRACKPAD_GLIDE_IDLE_MS) {
+        this.trackpadContactTarget.x = this.trackpadContact.x;
+        this.trackpadContactTarget.y = this.trackpadContact.y;
+      }
+      const target = this.trackpadContactTarget;
+      target.x = Math.max(-13, Math.min(13, target.x + (nx - this.lastMouseNX) * 190));
+      target.y = Math.max(-9, Math.min(9, target.y + (ny - this.lastMouseNY) * 145));
+    }
     this.lastMouseNX = nx;
     this.lastMouseNY = ny;
 
     // Ignore micro-jitter while actively typing so a tiny desk bump never hijacks the typing paw
     const typingNow = now - this.lastAnyKeyAt < 500 || this.heldKeys.size > 0;
-    if (typingNow && moveDelta < 0.015) {
+    if (this.pointerDevice === 'mouse' && typingNow && moveDelta < 0.015) {
       return;
     }
 
@@ -1194,8 +1347,10 @@ export class KuroCatEngine {
     this.mouseTargetOffsetY = (ny - 0.5) * (this.catBreed === 'dafeiyu' ? 11 : 20);
     this.lastMouseMoveAt = now;
 
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.lastActiveAt = now;
+    if (this.pointerDevice !== 'trackpad' || this.pointerPaw.mode !== 'poke') {
+      this.pointerPaw.mode = 'mouse';
+      this.pointerPaw.lastActiveAt = now;
+    }
   }
 
   private getMouseButtonColors(): { left: string; right: string; middle: string } {
@@ -1214,6 +1369,10 @@ export class KuroCatEngine {
           ? '#4690d8'
           : '#92ba12';
 
+    if (this.pointerDevice === 'trackpad') {
+      return { left: TRACKPAD_LEFT_COLOR, right: TRACKPAD_RIGHT_COLOR, middle: scroll };
+    }
+
     // Pick a high-contrast complementary color for RMB so Left vs Right click are unmistakable on every skin
     const isWarmAccent = /^#(f[a-f0-9][89a-c]|ff[789a-c]|e[89a-f][789a])/i.test(primary);
     const rightColor = isWarmAccent ? '#58c7ff' : '#ff7b3b';
@@ -1225,8 +1384,13 @@ export class KuroCatEngine {
     const colors = this.getMouseButtonColors();
     const label = button === 'left' ? 'LMB' : button === 'right' ? 'RMB' : 'MMB';
     const color = button === 'left' ? colors.left : button === 'right' ? colors.right : colors.middle;
-    const mx = this.mouseBaseX + this.mouseOffsetX;
-    const my = this.mouseBaseY + this.mouseOffsetY;
+    const trackpad = this.pointerDevice === 'trackpad';
+    const anchor = trackpad
+      ? this.getTrackpadContactWorld()
+      : { x: this.mouseBaseX + this.mouseOffsetX, y: this.mouseBaseY + this.mouseOffsetY };
+    const badgeY = trackpad
+      ? this.mouseBaseY - (this.usesLowProfileDesk ? DESK_TRACKPAD_DEPTH / 2 + 12 : 29)
+      : anchor.y - 30;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const sideShift =
       button === 'left'
@@ -1246,8 +1410,8 @@ export class KuroCatEngine {
       id: this.nextBubbleId++,
       label,
       color,
-      x: Math.max(24, mx + sideShift),
-      y: my - 30,
+      x: Math.max(24, Math.min(this.logicalW - 24, anchor.x + sideShift)),
+      y: badgeY,
       createdAt: now,
       lifetime: 560,
     });
@@ -1275,12 +1439,12 @@ export class KuroCatEngine {
     }
 
     this.lastMouseMoveAt = now;
+    this.dafeiyu.resetPointerHand(this.pointerOnRight);
+    this.pointerPaw.mode = 'mouse';
+    this.pointerPaw.impactSquash = 0.72;
     this.lastMouseClickAt = now;
-    this.dafeiyu.resetLeftHandForMouse();
     this.dafeiyu.onMouseAction(now);
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.impactSquash = 0.72;
-    this.leftPaw.lastActiveAt = now;
+    this.pointerPaw.lastActiveAt = now;
   }
 
   public onMouseUp(button: string): void {
@@ -1297,16 +1461,17 @@ export class KuroCatEngine {
     }
   }
 
-  public onMouseWheel(): void {
+  public onMouseWheel(delta = 0): void {
     const now = performance.now();
+    if (delta !== 0) this.trackpadScrollDirection = Math.sign(delta);
     this.wakeCat(now);
     this.mouseScrollFlash = 1;
     this.lastMouseMoveAt = now;
+    this.dafeiyu.resetPointerHand(this.pointerOnRight);
+    this.pointerPaw.mode = 'mouse';
     this.lastMouseClickAt = now;
-    this.dafeiyu.resetLeftHandForMouse();
     this.dafeiyu.onMouseAction(now);
-    this.leftPaw.mode = 'mouse';
-    this.leftPaw.lastActiveAt = now;
+    this.pointerPaw.lastActiveAt = now;
   }
 
   private resetPetStrokes(): void {
@@ -1404,10 +1569,15 @@ export class KuroCatEngine {
   // ---- Keyboard projection ----
 
   private projectKeyboardPoint(uCol: number, rowPos: number): Vec2 {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const screenU = isCatFacing ? layout.totalUnits - uCol : uCol;
     const screenRow = isCatFacing ? layout.totalRows - rowPos : rowPos;
+
+    if (this.usesLowProfileDesk) {
+      const bounds = this.lowProfileKeyBounds();
+      return this.projectDesk(bounds.left + screenU * bounds.unitWidth, bounds.top + screenRow * bounds.rowHeight);
+    }
 
     const padX = 7;
     const padY = 6;
@@ -1429,7 +1599,7 @@ export class KuroCatEngine {
   }
 
   private getKeyWorldCenter(spec: KeySpec): Vec2 {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const uClamped = Math.max(0.65, Math.min(layout.totalUnits - 0.65, spec.uStart + spec.uWidth * 0.5));
     const rY = spec.rowY ?? spec.row;
@@ -1444,6 +1614,13 @@ export class KuroCatEngine {
   }
 
   private clampToKeyboardSurface(pt: Vec2): Vec2 {
+    if (this.usesLowProfileDesk) {
+      const top = this.kbCenterY - this.kbHeight / 2;
+      const y = Math.max(top + 9, Math.min(top + this.kbHeight - 8, pt.y));
+      const left = this.projectDesk(this.kbCenterX - this.kbWidth / 2 + 10, y).x;
+      const right = this.projectDesk(this.kbCenterX + this.kbWidth / 2 - 10, y).x;
+      return { x: Math.max(left, Math.min(right, pt.x)), y };
+    }
     // Transform into keyboard-local space and clamp so the plump paw pad NEVER extends past the keyboard bezel!
     const dx = pt.x - this.kbCenterX;
     const dy = pt.y - this.kbCenterY;
@@ -1564,6 +1741,10 @@ export class KuroCatEngine {
     const mLerp = 1 - Math.exp(-28 * dt);
     this.mouseOffsetX += (this.mouseTargetOffsetX - this.mouseOffsetX) * mLerp;
     this.mouseOffsetY += (this.mouseTargetOffsetY - this.mouseOffsetY) * mLerp;
+    if (this.pointerOnRight) {
+      this.mouseOffsetX = Math.max(-VIEWER_MOUSE_TRAVEL_X, Math.min(VIEWER_MOUSE_TRAVEL_X, this.mouseOffsetX));
+      this.mouseOffsetY = Math.max(-VIEWER_MOUSE_TRAVEL_Y, Math.min(VIEWER_MOUSE_TRAVEL_Y, this.mouseOffsetY));
+    }
     if (!this.mouseLeftDown && this.mouseLeftPress > 0) {
       this.mouseLeftPress = Math.max(0, this.mouseLeftPress - dt * 5.8);
     }
@@ -1573,6 +1754,14 @@ export class KuroCatEngine {
     if (!this.mouseMiddleDown && this.mouseMiddlePress > 0) {
       this.mouseMiddlePress = Math.max(0, this.mouseMiddlePress - dt * 5.8);
     }
+    if (!this.isTrackpadActive(now, TRACKPAD_GLIDE_IDLE_MS)) {
+      this.trackpadContactTarget.x *= Math.exp(-5 * dt);
+      this.trackpadContactTarget.y *= Math.exp(-5 * dt);
+    }
+    this.trackpadContact.x += (this.trackpadContactTarget.x - this.trackpadContact.x) * mLerp;
+    this.trackpadContact.y += (this.trackpadContactTarget.y - this.trackpadContact.y) * mLerp;
+    const scrollTarget = this.mouseScrollFlash > 0.12 ? this.trackpadScrollDirection * 7 : 0;
+    this.trackpadScrollOffset += (scrollTarget - this.trackpadScrollOffset) * (1 - Math.exp(-18 * dt));
     this.mouseScrollFlash = Math.max(0, this.mouseScrollFlash - dt * 4.5);
     this.mouseBadges = this.mouseBadges.filter((b) => now - b.createdAt < b.lifetime);
 
@@ -1707,14 +1896,14 @@ export class KuroCatEngine {
     this.kbBounce = Math.max(0, this.kbBounce - dt * 15);
 
     // Playful left-right body & head groove sway during pure typing
-    const pureTypingActive = isTypingRecently && this.leftPaw.mode !== 'mouse';
+    const pureTypingActive = isTypingRecently && this.pointerPaw.mode !== 'mouse';
     if (pureTypingActive) {
       this.typingGroovePhase += dt * (4.8 + this.typingEnergy * 5.2);
     }
     const grooveWave = Math.sin(this.typingGroovePhase) * (0.58 + this.typingEnergy * 0.44);
     const targetTypingSway = pureTypingActive
       ? Math.max(-1.1, Math.min(1.1, grooveWave * 0.72 + this.lastKeyBias * 0.55))
-      : this.leftPaw.mode === 'mouse' && isTypingRecently
+      : this.pointerPaw.mode === 'mouse' && isTypingRecently
         ? Math.sin(this.typingGroovePhase) * 0.16
         : 0;
     const swayAcc = (targetTypingSway - this.typingSway) * 118 - this.typingSwayVel * 12.5;
@@ -1723,11 +1912,10 @@ export class KuroCatEngine {
 
     // Measured spine-shear lean via 240Hz spring (1.9 Hz -> organic weighty follow-through!)
     let targetLean = 0;
-    if (this.leftPaw.mode === 'mouse') {
+    if (this.pointerPaw.mode === 'mouse') {
+      const side = this.pointerOnRight ? 1 : -1;
       const mouseSweepBias = (this.mouseOffsetX / 18) * 0.22;
-      targetLean = this.rightPaw.mode === 'poke'
-        ? -0.52 + mouseSweepBias
-        : -0.96 + mouseSweepBias;
+      targetLean = side * (this.keyboardPaw.mode === 'poke' ? 0.52 : 0.96) + mouseSweepBias;
     } else if (this.catTail.reach > 0.05) {
       const tailDir = Math.max(-1, Math.min(1, (this.catTail.tipX - this.catCenterX) / (this.kbWidth * 0.5)));
       targetLean = tailDir * 0.14 * this.catTail.reach;
@@ -1782,7 +1970,7 @@ export class KuroCatEngine {
     this.earPerkSpring.step(earTarget, dt);
 
     if (this.catBreed === 'dafeiyu') {
-      this.dafeiyu.update(dt, now, this.buildDaFeiYuLayout());
+      this.dafeiyu.update(dt, now, this.buildDaFeiYuLayout(now));
     } else {
       // Update plush cat tail key-patting physics for keys near the tail
       if (this.privacyMode || this.asleep) {
@@ -1996,7 +2184,10 @@ export class KuroCatEngine {
       const isCatFacing = this.keyboardOrientation === 'cat';
       const lrBias = this.mouseLeftPress - this.mouseRightPress;
       const anyClickPress = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
-      if (isCatFacing) {
+      if (this.pointerDevice === 'trackpad') {
+        const contact = this.getTrackpadContactWorld();
+        paw.target = { x: contact.x, y: contact.y + anyClickPress * 2 };
+      } else if (isCatFacing) {
         // 180° cat-facing: palm heel at TOP, LMB = inner/+X, RMB = outer/-X
         paw.target = {
           x: liveMouseX + 1.2 + lrBias * 6.4,
@@ -2009,11 +2200,10 @@ export class KuroCatEngine {
           y: liveMouseY + 10.0 - anyClickPress * 3.4,
         };
       }
-      const stillHolding =
-        this.mouseLeftDown ||
-        this.mouseRightDown ||
-        this.mouseMiddleDown ||
-        now - this.lastMouseMoveAt < 2200;
+      const stillHolding = this.pointerDevice === 'trackpad'
+        ? this.isTrackpadActive(now)
+        : this.mouseLeftDown || this.mouseRightDown || this.mouseMiddleDown ||
+          now - this.lastMouseMoveAt < 2200;
       if (!stillHolding) {
         paw.mode = heldKey ? 'poke' : 'idle';
       }
@@ -2026,7 +2216,10 @@ export class KuroCatEngine {
     } else if (paw.mode === 'poke') {
       paw.pokeTime += dt;
       if (paw.pokeTime > 0.13) {
-        if (paw.side === 'left' && (this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 450)) {
+        const returnToPointer = this.pointerDevice === 'trackpad'
+          ? this.isTrackpadActive(now, 320)
+          : this.mouseLeftDown || this.mouseRightDown || now - this.lastMouseMoveAt < 450;
+        if (paw === this.pointerPaw && returnToPointer) {
           paw.mode = 'mouse';
         } else if (now - this.lastAnyKeyAt < 650 || this.heldKeys.size > 0) {
           paw.mode = 'curled';
@@ -2097,9 +2290,9 @@ export class KuroCatEngine {
 
     if (this.catBreed === 'dafeiyu') {
       const now = performance.now();
-      const layout = this.buildDaFeiYuLayout();
+      const layout = this.buildDaFeiYuLayout(now);
       this.dafeiyu.renderBody(ctx, now, layout);
-      this.drawMiniMouse(ctx);
+      this.drawPointerDevice(ctx);
       this.drawKeyboard(ctx);
       this.dafeiyu.renderForeground(ctx, this.lastDt, now, layout);
       if (this.showKeyBubbles && !this.privacyMode) {
@@ -2111,7 +2304,7 @@ export class KuroCatEngine {
     }
 
     // Layer 1: Mini mouse & mechanical keyboard (both hop organically on grumpy tail desk-slam!)
-    this.drawMiniMouse(ctx);
+    this.drawPointerDevice(ctx);
     this.drawKeyboard(ctx);
 
     // Layer 2: Plush cat tail (above keyboard so near-tail key pats & angry desk-thumps land cleanly, yet tucked behind hip!)
@@ -2165,7 +2358,7 @@ export class KuroCatEngine {
         lifetime: 460,
       });
     }
-    this.deskHopSpring.kick(-38);
+    if (!this.usesLowProfileDesk) this.deskHopSpring.kick(-38);
     this.squashSpring.kick(2.4);
   }
 
@@ -3093,10 +3286,257 @@ export class KuroCatEngine {
     }
   }
 
+  private drawPointerDevice(ctx: CanvasRenderingContext2D): void {
+    if (this.pointerDevice === 'trackpad') {
+      if (this.usesLowProfileDesk) this.drawLargeTrackpad(ctx);
+      else this.drawTrackpad(ctx);
+    } else {
+      this.drawMiniMouse(ctx);
+    }
+  }
+
+  private lowProfileKeyBounds() {
+    const rearInset = this.keyboardOrientation === 'viewer' ? DESK_KEYS_TOP_INSET : DESK_KEYS_BOTTOM_INSET;
+    return {
+      left: this.kbCenterX - this.kbWidth / 2 + DESK_KEYS_SIDE_INSET,
+      top: this.kbCenterY - this.kbHeight / 2 + rearInset,
+      unitWidth: (this.kbWidth - 2 * DESK_KEYS_SIDE_INSET) / LOW_PROFILE_LAYOUT.totalUnits,
+      rowHeight: (this.kbHeight - DESK_KEYS_TOP_INSET - DESK_KEYS_BOTTOM_INSET) / LOW_PROFILE_LAYOUT.totalRows,
+    };
+  }
+
+  private lowProfileKeyBedLift(): number {
+    return 3.3 - this.kbBounce * 0.8;
+  }
+
+  private drawLowProfileKeyboard(ctx: CanvasRenderingContext2D): void {
+    const { totalUnits, totalRows, keys } = LOW_PROFILE_LAYOUT;
+    const viewer = this.keyboardOrientation === 'viewer';
+    const left = this.kbCenterX - this.kbWidth / 2;
+    const top = this.kbCenterY - this.kbHeight / 2;
+    const lift = this.lowProfileKeyBedLift();
+    const center = this.logicalW / 2;
+    const bounds = this.lowProfileKeyBounds();
+
+    ctx.save();
+    ctx.save();
+    ctx.shadowColor = 'rgba(9, 16, 28, 0.26)';
+    ctx.shadowBlur = 7;
+    ctx.shadowOffsetY = 3.2;
+    ctx.fillStyle = '#7c8490';
+    traceDeskRect(ctx, center, left, top, this.kbWidth, this.kbHeight, 5);
+    ctx.fill();
+    ctx.restore();
+
+    const frame = ctx.createLinearGradient(0, top, 0, top + this.kbHeight);
+    frame.addColorStop(0, '#f3f5f6');
+    frame.addColorStop(0.48, '#b9c3cc');
+    frame.addColorStop(1, '#dce0e4');
+    ctx.fillStyle = frame;
+    traceDeskRect(ctx, center, left, top, this.kbWidth, this.kbHeight, 5, lift);
+    ctx.fill();
+    ctx.strokeStyle = '#6d7581';
+    ctx.lineWidth = 0.85;
+    ctx.stroke();
+
+    ctx.fillStyle = '#515b65';
+    traceDeskRect(ctx, center, left + 2.4, top + 2, this.kbWidth - 4.8, this.kbHeight - 4, 3.5, lift);
+    ctx.fill();
+
+    const stripY = viewer ? top + 2.8 : top + this.kbHeight - 11;
+    ctx.fillStyle = '#353c46';
+    traceDeskRect(ctx, center, left + 4, stripY, this.kbWidth - 8, 8.2, 2.8, lift);
+    ctx.fill();
+    const stripCenter = this.projectDesk(this.kbCenterX, stripY + 4.3);
+    const stripLight = ctx.createLinearGradient(
+      stripCenter.x - this.kbWidth * 0.45, 0, stripCenter.x + this.kbWidth * 0.45, 0,
+    );
+    stripLight.addColorStop(0, '#a7e171');
+    stripLight.addColorStop(0.52, '#72e4b9');
+    stripLight.addColorStop(1, '#8ed8ff');
+    ctx.globalAlpha = 0.72;
+    ctx.fillStyle = stripLight;
+    traceDeskRect(ctx, center, left + 7, stripY + 6.9, this.kbWidth - 14, 0.65, 0.3, lift);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.save();
+    ctx.translate(stripCenter.x, stripCenter.y - lift);
+    if (!viewer) ctx.rotate(Math.PI);
+    ctx.fillStyle = stripLight;
+    ctx.font = '700 5.4px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('R E P U B L I C   O F   G A M E R S', 0, -0.45);
+    ctx.restore();
+
+    const gap = 0.95;
+    for (const key of keys) {
+      const col = viewer ? key.uStart : totalUnits - key.uStart - key.uWidth;
+      const row = viewer ? key.row : totalRows - 1 - key.row;
+      const x = bounds.left + col * bounds.unitWidth + gap / 2;
+      const y = bounds.top + row * bounds.rowHeight + gap / 2;
+      const w = key.uWidth * bounds.unitWidth - gap;
+      const h = bounds.rowHeight - gap;
+      const press = this.keyAnims.get(key.id)?.pressAmount ?? 0;
+      const keyLift = lift + 1.65 - press * 1.35;
+      const lit = press > 0.14;
+      const selected = this.tailPickerActive && this.tailKeyIdSet.has(key.id);
+      const hovered = this.tailPickerActive && this.tailPickerHoverId === key.id;
+      const hue = 74 + (key.uStart / (totalUnits - 1)) * 108;
+
+      ctx.fillStyle = lit ? '#819469' : '#aebac7';
+      traceDeskRect(ctx, center, x - 0.2, y, w + 0.4, h, 1.6, lift);
+      ctx.fill();
+      ctx.fillStyle = lit || selected ? 'hsl(83 79% 77%)' : `hsl(${hue} 30% 96%)`;
+      traceDeskRect(ctx, center, x + 0.25, y + 0.15, w - 0.5, h - 0.8, 1.55, keyLift);
+      ctx.fill();
+      if (hovered || selected) {
+        ctx.strokeStyle = hovered ? '#3a5526' : '#819469';
+        ctx.lineWidth = hovered ? 0.9 : 0.55;
+        ctx.stroke();
+      }
+
+      const label = key.id === 'space' ? '━' : key.id === 'esc' ? 'Esc' : key.label;
+      const labelPoint = this.projectDesk(x + w / 2, y + h * 0.51);
+      ctx.save();
+      ctx.translate(labelPoint.x, labelPoint.y - keyLift);
+      if (!viewer) ctx.rotate(Math.PI);
+      ctx.fillStyle = lit ? '#252d19' : `hsl(${hue} 62% 27%)`;
+      ctx.font = `700 ${label.length >= 3 ? 4.65 : 6.25}px system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, 0, 0);
+      ctx.restore();
+    }
+
+    if (this.privacyClose > 0.08) {
+      ctx.globalAlpha = this.privacyClose;
+      ctx.fillStyle = 'rgba(15, 20, 32, 0.86)';
+      traceDeskRect(ctx, center, left + 2, top + 2, this.kbWidth - 4, this.kbHeight - 4, 4.5, lift + 1.7);
+      ctx.fill();
+      ctx.fillStyle = '#fbcfe8';
+      ctx.font = '700 11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('🔒 密码输入中 · 已隐藏按键', this.kbCenterX, this.kbCenterY);
+    }
+    ctx.restore();
+  }
+
+  private drawLargeTrackpad(ctx: CanvasRenderingContext2D): void {
+    const left = this.mouseBaseX - DESK_TRACKPAD_WIDTH / 2;
+    const top = this.mouseBaseY - DESK_TRACKPAD_DEPTH / 2;
+    const center = this.logicalW / 2;
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const lift = 2.25 - press * 0.65;
+    ctx.save();
+    ctx.save();
+    ctx.shadowColor = 'rgba(9, 16, 28, 0.27)';
+    ctx.shadowBlur = 7;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = '#8895a1';
+    traceDeskRect(ctx, center, left, top, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH, 8);
+    ctx.fill();
+    ctx.restore();
+
+    const surface = ctx.createLinearGradient(0, top, 0, top + DESK_TRACKPAD_DEPTH);
+    surface.addColorStop(0, '#f8fbff');
+    surface.addColorStop(0.58, '#edf2f8');
+    surface.addColorStop(1, '#dfe6ee');
+    ctx.fillStyle = surface;
+    ctx.strokeStyle = '#84919e';
+    ctx.lineWidth = 0.9;
+    traceDeskRect(ctx, center, left, top, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH, 8, lift);
+    ctx.fill();
+    this.fillTrackpadClick(ctx);
+    ctx.stroke();
+    ctx.clip();
+
+    const origin = this.projectDesk(this.mouseBaseX, this.mouseBaseY);
+    const contact = this.getTrackpadContactWorld();
+    ctx.translate(origin.x, origin.y - lift);
+    this.drawTrackpadContacts(ctx, { x: contact.x - origin.x, y: contact.y - origin.y });
+    ctx.restore();
+  }
+
+  private drawTrackpad(ctx: CanvasRenderingContext2D): void {
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const contact = this.getTrackpadContact();
+    ctx.save();
+    ctx.translate(this.mouseBaseX, this.mouseBaseY);
+    ctx.rotate(this.kbTiltRad);
+    const viewerFacing = this.keyboardOrientation === 'viewer';
+    ctx.transform(1, 0, viewerFacing ? 0 : -0.10, 0.84, 0, 0);
+    const traceSurface = (top: number, bottom: number) => {
+      if (viewerFacing) {
+        this.trapezoidPath(ctx, TRACKPAD_REAR_HALF_WIDTH, TRACKPAD_FRONT_HALF_WIDTH, top, bottom, 6);
+      } else {
+        this.roundRect(ctx, -26, top, 52, bottom - top, 6);
+      }
+    };
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.30)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = '#9298a0';
+    traceSurface(-18, 21);
+    ctx.fill();
+    ctx.restore();
+
+    const surface = ctx.createLinearGradient(0, -21, 0, 21);
+    surface.addColorStop(0, '#f0f2f4');
+    surface.addColorStop(1, '#d2d6da');
+    ctx.fillStyle = surface;
+    ctx.strokeStyle = '#727b85';
+    ctx.lineWidth = 1.2;
+    traceSurface(-20 + press * 1.5, 18 + press * 1.5);
+    ctx.fill();
+    this.fillTrackpadClick(ctx);
+    ctx.stroke();
+    ctx.clip();
+    this.drawTrackpadContacts(ctx, contact);
+    ctx.restore();
+  }
+
+  private fillTrackpadClick(ctx: CanvasRenderingContext2D): void {
+    const right = this.mouseRightDown || (!this.mouseLeftDown && this.mouseRightPress > this.mouseLeftPress);
+    const press = right ? this.mouseRightPress : this.mouseLeftPress;
+    if (press <= 0.01) return;
+
+    ctx.save();
+    ctx.globalAlpha *= press;
+    ctx.fillStyle = right ? TRACKPAD_RIGHT_COLOR : TRACKPAD_LEFT_COLOR;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  private drawTrackpadContacts(ctx: CanvasRenderingContext2D, contact: Vec2): void {
+    const press = Math.max(this.mouseLeftPress, this.mouseRightPress, this.mouseMiddlePress);
+    const moving = Math.max(0, 1 - (performance.now() - this.lastMouseMoveAt) / TRACKPAD_GLIDE_IDLE_MS);
+    const drawContact = (offset: number, intensity: number, color: string) => {
+      if (intensity <= 0.02) return;
+      ctx.globalAlpha = intensity;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.ellipse(contact.x + offset, contact.y, 4.6 + press * 2, 4.6 + press * 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    };
+    const colors = this.getMouseButtonColors();
+    if (this.mouseRightPress > 0.05 || this.mouseScrollFlash > 0.05) {
+      const intensity = Math.max(this.mouseRightPress, this.mouseScrollFlash) * 0.82;
+      const color = this.mouseRightPress > this.mouseScrollFlash ? colors.right : colors.middle;
+      drawContact(-6, intensity, color);
+      drawContact(6, intensity, color);
+    } else {
+      drawContact(0, Math.max(press * 0.82, moving * 0.33), colors.left);
+    }
+  }
+
   private drawMiniMouse(ctx: CanvasRenderingContext2D): void {
     const mx = this.mouseBaseX + this.mouseOffsetX;
     const my = this.mouseBaseY + this.mouseOffsetY + this.deskHopY * 1.35;
-    const rx = 18.5;
+    const rx = MOUSE_HALF_WIDTH;
     const ry = 23.0;
     const lPress = this.mouseLeftPress;
     const rPress = this.mouseRightPress;
@@ -3105,7 +3545,7 @@ export class KuroCatEngine {
 
     ctx.save();
     ctx.translate(mx, my);
-    ctx.rotate(-0.06);
+    ctx.rotate(this.keyboardOrientation === 'viewer' ? this.kbTiltRad : -0.06);
 
     // Soft 3D base rim / drop shadow
     ctx.save();
@@ -3235,7 +3675,12 @@ export class KuroCatEngine {
   }
 
   private drawKeyboard(ctx: CanvasRenderingContext2D): void {
-    const layout = getKeyboardLayout(this.keyboardLayout);
+    if (this.usesLowProfileDesk) {
+      this.drawLowProfileKeyboard(ctx);
+      return;
+    }
+
+    const layout = this.currentLayout;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const is108 = this.keyboardLayout === '108';
     const padX = 7;
@@ -3695,10 +4140,11 @@ export class KuroCatEngine {
       ctx.save();
       ctx.globalAlpha = paw.idleWeight;
 
-      if (paw.side === 'right' && this.leftPaw.mode === 'mouse') {
+      if (paw === this.keyboardPaw && this.pointerPaw.mode === 'mouse') {
+        const side = paw.side === 'right' ? 1 : -1;
         const sh = this.getLiveShoulder(paw, breath);
         const baseSp = this.spinePoint(1.0, breath);
-        this.drawPlumpCatArm(ctx, 'right', sh.x - 4, sh.y + 8, baseSp.x + 28, baseSp.y - 2, 0, true);
+        this.drawPlumpCatArm(ctx, paw.side, sh.x - side * 4, sh.y + 8, baseSp.x + side * 28, baseSp.y - 2, 0, true);
       } else {
         // Exact 4-line seated leg silhouette from ORIG 0.3s (outer curved leg line + crisp inner center-gap line!)
         const topSp = this.spinePoint(0.66, breath);

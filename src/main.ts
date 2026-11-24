@@ -7,6 +7,7 @@ import {
   KuroCatEngine,
   TAIL_KEY_PRESETS,
   type KeyboardOrientation,
+  type PointerDevice,
   type TailKeyMode,
 } from './catEngine';
 import { catAudio } from './audio';
@@ -27,6 +28,7 @@ interface AppSettings {
   mcpPort: number;
   keyboardLayout: KeyboardLayoutId;
   keyboardOrientation: KeyboardOrientation;
+  pointerDevice?: PointerDevice;
   privacyPasswordGuard: boolean;
   tailKeyMode: TailKeyMode;
   tailKeyIds: string[];
@@ -126,7 +128,7 @@ const tailPickerTitleEl = document.getElementById('tail-picker-title') as HTMLSp
 const btnTailDoneEl = document.getElementById('btn-tail-done') as HTMLButtonElement;
 const tailModeBadgeEl = document.getElementById('tail-mode-badge') as HTMLSpanElement;
 const tailKeysCountEl = document.getElementById('tail-keys-count') as HTMLSpanElement;
-const engine = new KuroCatEngine(canvas);
+const engine = new KuroCatEngine(canvas, { personalDesk: true });
 
 function renderBreedPills(): void {
   if (!breedPillsEl) return;
@@ -216,6 +218,13 @@ function syncMenuUI(): void {
   engine.showKeyBubbles = settings.showKeyBubbles;
   engine.setCatAppearance(activeCat?.id || 'black', activeCat);
   engine.setKeyboardConfig(kbLayout, kbOrient);
+  const pointerDevice = settings.pointerDevice === 'trackpad' ? 'trackpad' : 'mouse';
+  engine.setPointerDevice(pointerDevice);
+  document.querySelectorAll<HTMLButtonElement>('[data-pointerdevice]').forEach((btn) => {
+    const active = btn.dataset.pointerdevice === pointerDevice;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
+  });
   engine.setTailKeyConfig(tailMode, tailIds);
   if (!sliderDragging) {
     engine.setRenderScale(settings.scale);
@@ -537,6 +546,10 @@ async function bootstrap(): Promise<void> {
     if (loadedVer) {
       appVersion = loadedVer;
       setUpdateHint(`v${appVersion}`);
+      if (appVersion.endsWith(' · 键盘与触控板试用')) {
+        menuEl.querySelectorAll<HTMLElement>('[data-action="check-update"], [data-action="toggle-autostart"]')
+          .forEach((button) => { button.style.display = 'none'; });
+      }
     }
     syncMenuUI();
   } catch (err) {
@@ -670,7 +683,7 @@ async function bootstrap(): Promise<void> {
         engine.onMouseUp(p.button);
         break;
       case 'mouseWheel':
-        engine.onMouseWheel();
+        engine.onMouseWheel(p.delta);
         break;
       case 'privacyTyping':
         engine.onPrivacyTyping();
@@ -747,7 +760,7 @@ async function bootstrap(): Promise<void> {
 
   menuEl.addEventListener('click', (e) => {
     const target = (e.target as HTMLElement).closest<HTMLElement>(
-      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient], [data-tailmode]',
+      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient], [data-pointerdevice], [data-tailmode]',
     );
     if (!target) return;
 
@@ -761,6 +774,13 @@ async function bootstrap(): Promise<void> {
     const kbOrientAttr = target.dataset.kborient;
     if (kbOrientAttr === 'cat' || kbOrientAttr === 'viewer') {
       void applySettingsPatch({ keyboardOrientation: kbOrientAttr });
+      closeContextMenu();
+      return;
+    }
+
+    const pointerDevice = target.dataset.pointerdevice;
+    if (pointerDevice === 'mouse' || pointerDevice === 'trackpad') {
+      void applySettingsPatch({ pointerDevice });
       closeContextMenu();
       return;
     }

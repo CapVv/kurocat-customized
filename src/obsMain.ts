@@ -2,6 +2,7 @@ import {
   DEFAULT_TAIL_KEY_IDS,
   KuroCatEngine,
   type KeyboardOrientation,
+  type PointerDevice,
   type TailKeyMode,
 } from './catEngine';
 import { catAudio } from './audio';
@@ -14,6 +15,7 @@ interface ObsAppSettings {
   catBreed?: string;
   keyboardLayout?: KeyboardLayoutId;
   keyboardOrientation?: KeyboardOrientation;
+  pointerDevice?: PointerDevice;
   tailKeyMode?: TailKeyMode;
   tailKeyIds?: string[];
 }
@@ -34,7 +36,7 @@ interface ObsStateSnapshot {
 }
 
 const canvas = document.getElementById('obs-canvas') as HTMLCanvasElement;
-const engine = new KuroCatEngine(canvas);
+const engine = new KuroCatEngine(canvas, { personalDesk: true });
 
 // Mute audio inside OBS Browser Source so purring never double-plays on stream
 catAudio.setEnabled(false);
@@ -83,6 +85,7 @@ function applyState(): void {
     overrideBubbles !== null ? overrideBubbles : currentSettings.showKeyBubbles !== false;
   engine.setCatAppearance(activeCat?.id || 'black', activeCat);
   engine.setKeyboardConfig(layout, orient);
+  engine.setPointerDevice(currentSettings.pointerDevice === 'trackpad' ? 'trackpad' : 'mouse');
   engine.setTailKeyConfig(tailMode, tailIds);
   engine.setRenderScale(overrideScale ?? 1.0);
 }
@@ -107,7 +110,7 @@ function handleInput(p: InputEvent): void {
       engine.onMouseUp(p.button);
       break;
     case 'mouseWheel':
-      engine.onMouseWheel();
+      engine.onMouseWheel(p.delta);
       break;
     case 'privacyTyping':
       engine.onPrivacyTyping();

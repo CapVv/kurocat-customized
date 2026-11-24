@@ -1,0 +1,21 @@
+{
+  "productName": "KuroCat Desk Preview",
+  "identifier": "com.kurocat.pet.desk-preview",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "KuroCat Desk Preview",
+        "width": 420,
+        "height": 440,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false
+      }
+    ]
+  }
+}

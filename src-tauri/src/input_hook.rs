@@ -1220,6 +1220,7 @@ pub mod macos_hook {
             0x7C => 0x27, // Right
             0x7D => 0x28, // Down
             0x7E => 0x26, // Up
+            0x72 => 0x2D, // Help / external Insert
             0x73 => 0x24, // Home
             0x77 => 0x23, // End
             0x74 => 0x21, // PgUp

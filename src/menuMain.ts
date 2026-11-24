@@ -1,7 +1,7 @@
 import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { DEFAULT_TAIL_KEY_IDS, type KeyboardOrientation, type TailKeyMode } from './catEngine';
+import { DEFAULT_TAIL_KEY_IDS, type KeyboardOrientation, type PointerDevice, type TailKeyMode } from './catEngine';
 import { DEFAULT_BUILTIN_CATS, type CatSkinConfig } from './catSkins';
 import type { KeyboardLayoutId } from './keyboardLayout';
 
@@ -19,6 +19,7 @@ interface AppSettings {
   mcpPort: number;
   keyboardLayout: KeyboardLayoutId;
   keyboardOrientation: KeyboardOrientation;
+  pointerDevice?: PointerDevice;
   privacyPasswordGuard: boolean;
   tailKeyMode: TailKeyMode;
   tailKeyIds: string[];
@@ -149,6 +150,13 @@ function syncUI(): void {
   });
   document.querySelectorAll<HTMLButtonElement>('[data-kborient]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.kborient === kbOrient);
+  });
+
+  const pointerDevice = settings.pointerDevice === 'trackpad' ? 'trackpad' : 'mouse';
+  document.querySelectorAll<HTMLButtonElement>('[data-pointerdevice]').forEach((btn) => {
+    const active = btn.dataset.pointerdevice === pointerDevice;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-pressed', String(active));
   });
 
   const tailMode: TailKeyMode =
@@ -356,7 +364,7 @@ async function bootstrap(): Promise<void> {
 
   menuEl.addEventListener('click', (e) => {
     const target = (e.target as HTMLElement).closest<HTMLElement>(
-      '[data-action], [data-breed], [data-kblayout], [data-kborient], [data-tailmode]',
+      '[data-action], [data-breed], [data-kblayout], [data-kborient], [data-pointerdevice], [data-tailmode]',
     );
     if (!target) return;
 
@@ -369,6 +377,12 @@ async function bootstrap(): Promise<void> {
     const kbOrientAttr = target.dataset.kborient;
     if (kbOrientAttr === 'cat' || kbOrientAttr === 'viewer') {
       void applySettingsPatch({ keyboardOrientation: kbOrientAttr });
+      return;
+    }
+
+    const pointerDevice = target.dataset.pointerdevice;
+    if (pointerDevice === 'mouse' || pointerDevice === 'trackpad') {
+      void applySettingsPatch({ pointerDevice });
       return;
     }
 
