@@ -13,7 +13,7 @@ import { DaFeiYuRenderer, type DaFeiYuLayout } from './dafeiyuRenderer';
 import {
   DESK_KEYBOARD_WIDTH, DESK_KEYBOARD_DEPTH, DESK_TRACKPAD_SLOT_WIDTH, DESK_TRACKPAD_WIDTH, DESK_TRACKPAD_DEPTH,
   DESK_DEVICE_GAP, DESK_CENTER_Y, DESK_KEYS_SIDE_INSET, DESK_KEYS_TOP_INSET, DESK_KEYS_BOTTOM_INSET,
-  LOW_PROFILE_LAYOUT, projectDeskPoint, resolveLowProfileKey, traceDeskRect,
+  LOW_PROFILE_LAYOUT, POINTER_DEVICE_SCALE, projectDeskPoint, resolveLowProfileKey, traceDeskRect,
 } from './deskLayout';
 
 export const LOGICAL_W = 420;
@@ -530,8 +530,8 @@ export class KuroCatEngine {
     } else if (this.personalDesk && this.keyboardOrientation === 'viewer') {
       this.kbCenterX = this.logicalW - this.kbCenterX;
       const clearance = this.pointerDevice === 'trackpad'
-        ? TRACKPAD_FRONT_HALF_WIDTH
-        : MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X;
+        ? TRACKPAD_FRONT_HALF_WIDTH * POINTER_DEVICE_SCALE
+        : MOUSE_HALF_WIDTH * POINTER_DEVICE_SCALE + VIEWER_MOUSE_TRAVEL_X;
       const alongKeyboard = this.kbWidth * 0.5 + VIEWER_DEVICE_GAP + clearance;
       this.mouseBaseX = this.kbCenterX + alongKeyboard * Math.cos(this.kbTiltRad);
       this.mouseBaseY = this.kbCenterY + alongKeyboard * Math.sin(this.kbTiltRad);
@@ -542,7 +542,9 @@ export class KuroCatEngine {
     const direction = this.keyboardOrientation === 'viewer' ? 1 : -1;
     const trackpad = this.pointerDevice === 'trackpad';
     const deviceSlotWidth = trackpad ? DESK_TRACKPAD_SLOT_WIDTH : (MOUSE_HALF_WIDTH + VIEWER_MOUSE_TRAVEL_X) * 2;
-    const deviceWidth = trackpad ? DESK_TRACKPAD_WIDTH : deviceSlotWidth;
+    const deviceWidth = trackpad
+      ? DESK_TRACKPAD_WIDTH
+      : (MOUSE_HALF_WIDTH * POINTER_DEVICE_SCALE + VIEWER_MOUSE_TRAVEL_X) * 2;
     this.kbWidth = DESK_KEYBOARD_WIDTH;
     this.kbHeight = DESK_KEYBOARD_DEPTH;
     this.kbCenterY = DESK_CENTER_Y;
@@ -551,7 +553,7 @@ export class KuroCatEngine {
     const catOffset = trackpad && direction === 1 ? 28 : 12;
     this.catCenterX = this.kbCenterX + direction * catOffset;
     this.mouseBaseX = this.kbCenterX + direction * (this.kbWidth / 2 + DESK_DEVICE_GAP + deviceWidth / 2);
-    const deviceDepth = trackpad ? DESK_TRACKPAD_DEPTH : 48;
+    const deviceDepth = trackpad ? DESK_TRACKPAD_DEPTH : 48 * POINTER_DEVICE_SCALE;
     this.mouseBaseY = this.kbCenterY + (this.kbHeight - deviceDepth) / 2;
   }
 
@@ -573,8 +575,8 @@ export class KuroCatEngine {
 
   private getTrackpadContactWorld(): Vec2 {
     const contact = this.getTrackpadContact();
-    const x = this.mouseBaseX + contact.x;
-    const y = this.mouseBaseY + contact.y;
+    const x = this.mouseBaseX + contact.x * POINTER_DEVICE_SCALE;
+    const y = this.mouseBaseY + contact.y * POINTER_DEVICE_SCALE;
     return this.usesLowProfileDesk ? this.projectDesk(x, y) : { x, y };
   }
 
@@ -683,10 +685,10 @@ export class KuroCatEngine {
       kbTiltRad: this.kbTiltRad,
       mouseBtnX: this.pointerDevice === 'trackpad'
         ? contact.x
-        : mx + localBtnX * c - localBtnY * s,
+        : mx + (localBtnX * c - localBtnY * s) * POINTER_DEVICE_SCALE,
       mouseBtnY: this.pointerDevice === 'trackpad'
         ? contact.y
-        : my + localBtnX * s + localBtnY * c,
+        : my + (localBtnX * s + localBtnY * c) * POINTER_DEVICE_SCALE,
       mouseNX: this.lastMouseNX,
       pointerOnRight: this.pointerOnRight,
       mouseLeft: this.mouseLeftDown,
@@ -1389,7 +1391,7 @@ export class KuroCatEngine {
       ? this.getTrackpadContactWorld()
       : { x: this.mouseBaseX + this.mouseOffsetX, y: this.mouseBaseY + this.mouseOffsetY };
     const badgeY = trackpad
-      ? this.mouseBaseY - (this.usesLowProfileDesk ? DESK_TRACKPAD_DEPTH / 2 + 12 : 29)
+      ? this.mouseBaseY - (this.usesLowProfileDesk ? DESK_TRACKPAD_DEPTH / 2 + 12 : 21 * POINTER_DEVICE_SCALE + 8)
       : anchor.y - 30;
     const isCatFacing = this.keyboardOrientation === 'cat';
     const sideShift =
@@ -2190,14 +2192,14 @@ export class KuroCatEngine {
       } else if (isCatFacing) {
         // 180° cat-facing: palm heel at TOP, LMB = inner/+X, RMB = outer/-X
         paw.target = {
-          x: liveMouseX + 1.2 + lrBias * 6.4,
-          y: liveMouseY - 11.5 + anyClickPress * 3.6,
+          x: liveMouseX + (1.2 + lrBias * 6.4) * POINTER_DEVICE_SCALE,
+          y: liveMouseY + (-11.5 + anyClickPress * 3.6) * POINTER_DEVICE_SCALE,
         };
       } else {
         // 0° viewer-facing: palm heel at BOTTOM, LMB = left/-X, RMB = right/+X
         paw.target = {
-          x: liveMouseX + 0.5 - lrBias * 6.4,
-          y: liveMouseY + 10.0 - anyClickPress * 3.4,
+          x: liveMouseX + (0.5 - lrBias * 6.4) * POINTER_DEVICE_SCALE,
+          y: liveMouseY + (10 - anyClickPress * 3.4) * POINTER_DEVICE_SCALE,
         };
       }
       const stillHolding = this.pointerDevice === 'trackpad'
@@ -3452,10 +3454,10 @@ export class KuroCatEngine {
     ctx.stroke();
     ctx.clip();
 
-    const origin = this.projectDesk(this.mouseBaseX, this.mouseBaseY);
     const contact = this.getTrackpadContactWorld();
-    ctx.translate(origin.x, origin.y - lift);
-    this.drawTrackpadContacts(ctx, { x: contact.x - origin.x, y: contact.y - origin.y });
+    ctx.translate(contact.x, contact.y - lift);
+    ctx.scale(POINTER_DEVICE_SCALE, POINTER_DEVICE_SCALE);
+    this.drawTrackpadContacts(ctx, { x: 0, y: 0 });
     ctx.restore();
   }
 
@@ -3464,6 +3466,7 @@ export class KuroCatEngine {
     const contact = this.getTrackpadContact();
     ctx.save();
     ctx.translate(this.mouseBaseX, this.mouseBaseY);
+    ctx.scale(POINTER_DEVICE_SCALE, POINTER_DEVICE_SCALE);
     ctx.rotate(this.kbTiltRad);
     const viewerFacing = this.keyboardOrientation === 'viewer';
     ctx.transform(1, 0, viewerFacing ? 0 : -0.10, 0.84, 0, 0);
@@ -3546,6 +3549,7 @@ export class KuroCatEngine {
     ctx.save();
     ctx.translate(mx, my);
     ctx.rotate(this.keyboardOrientation === 'viewer' ? this.kbTiltRad : -0.06);
+    ctx.scale(POINTER_DEVICE_SCALE, POINTER_DEVICE_SCALE);
 
     // Soft 3D base rim / drop shadow
     ctx.save();
