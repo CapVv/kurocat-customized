@@ -9,3 +9,12 @@ src-tauri/target-win7/
 .DS_Store
 Thumbs.db
 __pycache__/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/web/
+*.jks
+*.keystore
+*.apk
+*.aab

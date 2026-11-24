@@ -200,6 +200,10 @@ def classify_platform(filename: str) -> str:
         return "macOS 通用版"
     if "win7" in low:
         return "Windows 7 兼容整合包"
+    if "linux" in low or low.endswith(".deb") or low.endswith(".appimage"):
+        if "arm64" in low or "aarch64" in low:
+            return "Linux / 麒麟版 (ARM64)"
+        return "Linux / 麒麟版 (x86_64)"
     if "108key" in low:
         return "Windows 108键安装版"
     if "setup.exe" in low or low.endswith(".msi"):

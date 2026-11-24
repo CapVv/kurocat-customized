@@ -15,6 +15,21 @@ body {
   font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
 }
 
+/* On Windows 7/8 ULW mode, the cat renders via native 256-level UpdateLayeredWindow while
+   #context-menu and #update-toast pop in via rounded Win32 overlay regions with crisp dark surfaces. */
+html.win7-ulw-mode .context-menu {
+  background: #18191e;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+html.win7-ulw-mode .update-toast,
+html.win7-ulw-mode .tail-picker-bar {
+  background: #14161c;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
 #pet-canvas {
   display: block;
   width: 100vw;
@@ -28,6 +43,10 @@ body {
 
 #pet-canvas.pet-dragging {
   cursor: grabbing;
+}
+
+#pet-canvas.tail-key-hover {
+  cursor: pointer;
 }
 
 .context-menu {
@@ -279,6 +298,134 @@ body {
   font-weight: 700;
 }
 
+.tail-mode-badge {
+  font-size: 10.5px;
+  color: #c8f538;
+  font-weight: 600;
+}
+
+.tail-mode-pills {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+
+.tail-pick-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5.5px 8px;
+  border-radius: 7px;
+  border: 1px dashed rgba(200, 245, 56, 0.45);
+  background: rgba(200, 245, 56, 0.08);
+  color: #edf7c4;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.tail-pick-trigger:hover {
+  background: rgba(200, 245, 56, 0.18);
+  border-color: rgba(200, 245, 56, 0.85);
+}
+
+.tail-picker-bar {
+  position: fixed;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(364px, calc(100vw - 14px));
+  padding: 8px 10px;
+  border-radius: 13px;
+  background: rgba(20, 22, 28, 0.94);
+  border: 1px solid rgba(200, 245, 56, 0.58);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(14px);
+  color: #f4f6f8;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 9997;
+  animation: toastPop 0.18s ease-out;
+}
+
+.tail-picker-bar.hidden {
+  display: none;
+}
+
+.tail-picker-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tail-picker-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #f4f6f8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tail-picker-done {
+  border: none;
+  border-radius: 999px;
+  background: #c8f538;
+  color: #111214;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3.5px 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: filter 0.12s ease, transform 0.12s ease;
+}
+
+.tail-picker-done:hover {
+  filter: brightness(1.06);
+  transform: translateY(-0.5px);
+}
+
+.tail-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.tail-preset-btn {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #e5e7eb;
+  border-radius: 6px;
+  padding: 3px 7px;
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.tail-preset-btn:hover {
+  background: rgba(200, 245, 56, 0.18);
+  border-color: rgba(200, 245, 56, 0.5);
+  color: #ffffff;
+}
+
+.tail-preset-btn.danger {
+  margin-left: auto;
+  color: #fca5a5;
+  border-color: rgba(255, 110, 110, 0.25);
+}
+
+.tail-preset-btn.danger:hover {
+  background: rgba(255, 92, 92, 0.2);
+  border-color: rgba(255, 110, 110, 0.55);
+}
+
 .scale-pill {
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: rgba(255, 255, 255, 0.05);
@@ -409,4 +556,74 @@ body {
     opacity: 1;
     transform: translate(-50%, 0) scale(1);
   }
+}
+
+/* Dedicated non-overlapping floating side menu window (`menu.html`) */
+html.menu-window-mode,
+body.menu-window-body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.floating-side-menu {
+  position: relative;
+  left: 0 !important;
+  top: 0 !important;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  max-height: none;
+  border-radius: 13px;
+  background: rgba(22, 24, 30, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: none;
+  padding: 7px;
+  overflow-y: auto;
+}
+
+html.win7-ulw-mode .floating-side-menu {
+  border-radius: 0;
+  background: #18191e;
+}
+
+.menu-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 4px;
+  padding: 4px 6px 6px 8px;
+}
+
+.menu-header-row .menu-header {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding: 0;
+}
+
+.menu-close-btn {
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(220, 224, 232, 0.65);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.menu-close-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.menu-item.hidden {
+  display: none;
 }

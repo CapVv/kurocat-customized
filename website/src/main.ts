@@ -1,12 +1,41 @@
-import { KuroCatEngine, type KeyboardOrientation } from '../../src/catEngine';
+import {
+  DEFAULT_TAIL_KEY_IDS,
+  KuroCatEngine,
+  TAIL_KEY_PRESETS,
+  type KeyboardOrientation,
+  type TailKeyMode,
+} from '../../src/catEngine';
 import { catAudio } from '../../src/audio';
-import type { KeyboardLayoutId } from '../../src/keyboardLayout';
+import { resolveKeyByVk, type KeyboardLayoutId } from '../../src/keyboardLayout';
 import { BUILTIN_WEB_CATS } from './builtinCats';
+import {
+  KUROCAT_I18N,
+  applyStaticI18n,
+  detectInitialLocale,
+  persistLocale,
+  type Locale,
+} from './i18n';
 import { keyboardEventToVk } from './webKeyMap';
 
-const LOCAL_MIRROR_VERSION = 'v4.7.0';
-const LOCAL_MIRROR_VER_NUM = '4.7.0';
-const MACOS_MIRROR_VERSION = 'v4.5.0';
+const LOCAL_MIRROR_VERSION = 'v4.9.1';
+const LOCAL_MIRROR_VER_NUM = '4.9.1';
+const MACOS_MIRROR_VERSION = 'v4.9.1';
+
+let currentLocale: Locale = detectInitialLocale();
+let i18n = KUROCAT_I18N[currentLocale];
+const localeListeners: Array<() => void> = [];
+let activeReleaseTag = LOCAL_MIRROR_VERSION;
+let activeReleaseAssets: ReleaseAssetMap | null = null;
+
+function setLocale(next: Locale, shouldPersist: boolean): void {
+  currentLocale = next;
+  i18n = applyStaticI18n(next);
+  if (shouldPersist) persistLocale(next);
+  if (activeReleaseAssets) {
+    applyReleaseUI(activeReleaseTag, activeReleaseAssets);
+  }
+  localeListeners.forEach((fn) => fn());
+}
 
 interface ReleaseAssetMap {
   win65: { name: string; primaryUrl: string; ghUrl: string; sizeText: string };
@@ -21,8 +50,8 @@ function buildDefaultAssets(): ReleaseAssetMap {
   const n65 = `KuroCat-${LOCAL_MIRROR_VER_NUM}-x64-setup.exe`;
   const nMac = `KuroCat-${MACOS_MIRROR_VERSION}-macos-universal.dmg`;
   return {
-    win65: { name: n65, primaryUrl: `${localBase}/${n65}`, ghUrl: `${ghBase}/${n65}`, sizeText: '1.62 MB' },
-    macos: { name: nMac, primaryUrl: `${macLocalBase}/${nMac}`, ghUrl: `${macGhBase}/${nMac}`, sizeText: '4.72 MB' },
+    win65: { name: n65, primaryUrl: `${localBase}/${n65}`, ghUrl: `${ghBase}/${n65}`, sizeText: '1.99 MB' },
+    macos: { name: nMac, primaryUrl: `${macLocalBase}/${nMac}`, ghUrl: `${macGhBase}/${nMac}`, sizeText: '5.61 MB' },
   };
 }
 
@@ -31,11 +60,14 @@ function formatBytesMB(bytes: number): string {
 }
 
 function applyReleaseUI(tag: string, assets: ReleaseAssetMap): void {
+  activeReleaseTag = tag;
+  activeReleaseAssets = assets;
+
   const navPill = document.getElementById('nav-ver-pill');
   if (navPill) navPill.textContent = tag;
 
   const heroVer = document.getElementById('hero-release-label');
-  if (heroVer) heroVer.textContent = `最新版本 ${tag}`;
+  if (heroVer) heroVer.textContent = i18n.fmt.latestVersion(tag);
 
   const isMac = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
   const heroBtn = document.getElementById('hero-primary-dl') as HTMLAnchorElement | null;
@@ -43,10 +75,10 @@ function applyReleaseUI(tag: string, assets: ReleaseAssetMap): void {
   if (heroBtn && heroLabel) {
     if (isMac) {
       heroBtn.href = assets.macos.primaryUrl;
-      heroLabel.textContent = `免费下载 macOS 通用版（${assets.macos.sizeText}）`;
+      heroLabel.textContent = i18n.fmt.heroDownloadMac(assets.macos.sizeText);
     } else {
       heroBtn.href = assets.win65.primaryUrl;
-      heroLabel.textContent = `免费下载 Windows 版（${assets.win65.sizeText}）`;
+      heroLabel.textContent = i18n.fmt.heroDownloadWin(assets.win65.sizeText);
     }
   }
 
@@ -213,34 +245,111 @@ function initPlayground(): void {
   let currentLayout: KeyboardLayoutId = '65';
   let currentOrient: KeyboardOrientation = 'cat';
   let currentSkinId = 'black';
+  let currentTailMode: TailKeyMode = 'smart';
+  let currentTailKeyIds: string[] = [...DEFAULT_TAIL_KEY_IDS];
+  let tailPickerOpen = false;
+  let tailPickerHintOverride: (() => string) | null = null;
   let autoDemoRunning = true;
   let autoDemoTimer: number | null = null;
 
   const statusPill = document.getElementById('stage-status-pill');
+  const stageHint = document.getElementById('stage-hint');
+  const webTailPickerBar = document.getElementById('web-tail-picker-bar');
+  const webTailPickerTitle = document.getElementById('web-tail-picker-title');
+  const btnWebTailPicker = document.getElementById('btn-web-tail-picker');
+  const btnWebTailDone = document.getElementById('btn-web-tail-done');
+
   const updateStatusPill = () => {
     if (!statusPill) return;
-    const layoutText = currentLayout === '108' ? '108 全尺寸' : '65% 紧凑';
-    const orientText = currentOrient === 'viewer' ? '面向观众' : '面向猫咪';
-    statusPill.textContent = `${layoutText} · ${orientText}`;
+    const layoutText = i18n.fmt.layout(currentLayout);
+    const orientText = i18n.fmt.orient(currentOrient);
+    statusPill.textContent = `${layoutText} · ${orientText} · ${i18n.tailModeShort[currentTailMode]}`;
+  };
+
+  const syncTailUI = () => {
+    engine.setTailKeyConfig(currentTailMode, currentTailKeyIds);
+    document.querySelectorAll<HTMLButtonElement>('[data-web-tailmode]').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.webTailmode === currentTailMode);
+    });
+    if (btnWebTailPicker) {
+      btnWebTailPicker.classList.toggle('active', tailPickerOpen);
+      btnWebTailPicker.textContent = i18n.fmt.tailPickerBtn(tailPickerOpen, currentTailKeyIds.length);
+    }
+    if (webTailPickerBar) {
+      webTailPickerBar.classList.toggle('hidden', !tailPickerOpen);
+    }
+    if (stageHint) {
+      stageHint.style.display = tailPickerOpen ? 'none' : '';
+    }
+    if (webTailPickerTitle) {
+      webTailPickerTitle.textContent = tailPickerHintOverride
+        ? tailPickerHintOverride()
+        : i18n.fmt.tailPickerTitleDefault(currentTailKeyIds.length);
+    }
+    updateStatusPill();
+  };
+
+  const setTailPickerOpen = (open: boolean) => {
+    tailPickerOpen = open;
+    tailPickerHintOverride = null;
+    if (open) {
+      if (autoDemoRunning) stopAutoDemo();
+      currentTailMode = 'custom';
+    } else {
+      viewport.classList.remove('tail-key-hover');
+    }
+    engine.setTailPickerActive(open);
+    syncTailUI();
+  };
+
+  const toggleWebTailKey = (specId: string, label?: string) => {
+    const idx = currentTailKeyIds.indexOf(specId);
+    let added = false;
+    if (idx >= 0) {
+      currentTailKeyIds.splice(idx, 1);
+    } else {
+      currentTailKeyIds.push(specId);
+      added = true;
+    }
+    currentTailMode = 'custom';
+    const keyText = label || specId.toUpperCase();
+    const count = currentTailKeyIds.length;
+    tailPickerHintOverride = () =>
+      added ? i18n.fmt.tailKeyAdded(keyText, count) : i18n.fmt.tailKeyRemoved(keyText, count);
+    syncTailUI();
+    if (added) {
+      engine.previewTailTap(specId);
+    }
   };
 
   engine.setCatAppearance('black', BUILTIN_WEB_CATS[0]);
   engine.setKeyboardConfig(currentLayout, currentOrient);
   engine.start();
-  updateStatusPill();
+  syncTailUI();
 
   const ro = new ResizeObserver(() => engine.resize());
   ro.observe(viewport);
 
-  // Build 6 skin buttons
+  // Build 7 skin buttons (re-labeled automatically when switching language)
   const skinHost = document.getElementById('skin-pills');
+  const syncSkinLabels = () => {
+    if (!skinHost) return;
+    skinHost.querySelectorAll<HTMLButtonElement>('.skin-btn').forEach((btn) => {
+      const id = btn.dataset.skinId || '';
+      const skin = BUILTIN_WEB_CATS.find((c) => c.id === id);
+      if (skin) {
+        const displayName = i18n.skins[skin.id] || skin.name;
+        btn.textContent = `${skin.emoji || '🐱'} ${displayName}`;
+      }
+    });
+  };
   if (skinHost) {
     BUILTIN_WEB_CATS.forEach((skin) => {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = `skin-btn${skin.id === currentSkinId ? ' active' : ''}`;
       btn.dataset.skinId = skin.id;
-      btn.textContent = `${skin.emoji || '🐱'} ${skin.name}`;
+      btn.textContent = `${skin.emoji || '🐱'} ${i18n.skins[skin.id] || skin.name}`;
       btn.addEventListener('click', () => {
         currentSkinId = skin.id;
         engine.setCatAppearance(skin.id, skin);
@@ -285,6 +394,62 @@ function initPlayground(): void {
     });
   });
 
+  // Tail key mode pills & visual keycap picker controls
+  document.querySelectorAll<HTMLButtonElement>('[data-web-tailmode]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const val = btn.dataset.webTailmode;
+      if (val === 'smart' || val === 'custom' || val === 'edge' || val === 'off') {
+        currentTailMode = val;
+        if (val !== 'custom' && tailPickerOpen) {
+          setTailPickerOpen(false);
+        } else {
+          syncTailUI();
+        }
+      }
+    });
+  });
+
+  btnWebTailPicker?.addEventListener('click', () => {
+    setTailPickerOpen(!tailPickerOpen);
+  });
+
+  btnWebTailDone?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setTailPickerOpen(false);
+  });
+
+  webTailPickerBar?.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+  });
+
+  webTailPickerBar?.addEventListener('click', (e) => {
+    const presetBtn = (e.target as HTMLElement).closest<HTMLElement>('[data-web-tailpreset]');
+    if (!presetBtn) return;
+    e.stopPropagation();
+    const preset = presetBtn.dataset.webTailpreset;
+    if (preset === 'office') {
+      currentTailKeyIds = [...TAIL_KEY_PRESETS.office.ids];
+      const count = currentTailKeyIds.length;
+      tailPickerHintOverride = () => i18n.fmt.tailPresetApplied('office', count);
+    } else if (preset === 'rightFn') {
+      currentTailKeyIds = [...TAIL_KEY_PRESETS.rightFn.ids];
+      const count = currentTailKeyIds.length;
+      tailPickerHintOverride = () => i18n.fmt.tailPresetApplied('rightFn', count);
+    } else if (preset === 'edgeMods') {
+      currentTailKeyIds = [...TAIL_KEY_PRESETS.edgeMods.ids];
+      const count = currentTailKeyIds.length;
+      tailPickerHintOverride = () => i18n.fmt.tailPresetApplied('edgeMods', count);
+    } else if (preset === 'clear') {
+      currentTailKeyIds = [];
+      tailPickerHintOverride = () => i18n.fmt.tailCleared();
+    }
+    currentTailMode = 'custom';
+    syncTailUI();
+    if (currentTailKeyIds.length > 0) {
+      engine.previewTailTap(currentTailKeyIds[0]);
+    }
+  });
+
   // Feature card button to jump & test 108-key
   const try108Btn = document.getElementById('try-108-btn');
   if (try108Btn) {
@@ -318,12 +483,13 @@ function initPlayground(): void {
   // Whale demo vertical video sound toggle
   const whaleVideo = document.getElementById('whale-demo-video') as HTMLVideoElement | null;
   const whaleSoundBtn = document.getElementById('whale-sound-toggle');
+  const syncSoundBtn = () => {
+    if (!whaleVideo || !whaleSoundBtn) return;
+    const muted = whaleVideo.muted;
+    whaleSoundBtn.classList.toggle('active', !muted);
+    whaleSoundBtn.textContent = i18n.fmt.whaleSoundBtn(muted);
+  };
   if (whaleVideo && whaleSoundBtn) {
-    const syncSoundBtn = () => {
-      const muted = whaleVideo.muted;
-      whaleSoundBtn.classList.toggle('active', !muted);
-      whaleSoundBtn.textContent = muted ? '🔇 点此开启音效' : '🔊 音效已开启';
-    };
     whaleSoundBtn.addEventListener('click', () => {
       whaleVideo.muted = !whaleVideo.muted;
       if (!whaleVideo.muted && whaleVideo.paused) {
@@ -376,7 +542,7 @@ function initPlayground(): void {
     engine.setPrivacyMode(active);
     if (btnPrivacy) {
       btnPrivacy.classList.toggle('active', active);
-      btnPrivacy.textContent = active ? '🙈 密码防偷窥中' : '🔒 密码防偷窥';
+      btnPrivacy.textContent = i18n.fmt.privacyBtn(active);
     }
   };
   if (btnPrivacy) {
@@ -400,6 +566,37 @@ function initPlayground(): void {
       engine.onPrivacyTyping();
     });
   }
+
+  // Alive cat emotion quick-test buttons (also trigger organically via fast cursor / key mash / idle!)
+  const ensureCatForEmotion = () => {
+    if (autoDemoRunning) stopAutoDemo();
+    if (manualPrivacyPinned) {
+      manualPrivacyPinned = false;
+      syncPrivacyState();
+    }
+    if (currentSkinId === 'dafeiyu') {
+      const black = BUILTIN_WEB_CATS.find((c) => c.id === 'black');
+      if (black) {
+        currentSkinId = black.id;
+        engine.setCatAppearance(black.id, black);
+        skinHost?.querySelectorAll('.skin-btn').forEach((el) => {
+          el.classList.toggle('active', (el as HTMLElement).dataset.skinId === black.id);
+        });
+      }
+    }
+  };
+  document.getElementById('btn-curious-demo')?.addEventListener('click', () => {
+    ensureCatForEmotion();
+    engine.triggerCuriousDemo(3600);
+  });
+  document.getElementById('btn-cross-demo')?.addEventListener('click', () => {
+    ensureCatForEmotion();
+    engine.triggerCrossDemo();
+  });
+  document.getElementById('btn-sleep-demo')?.addEventListener('click', () => {
+    ensureCatForEmotion();
+    engine.triggerSleepDemo();
+  });
 
   // Scale slider (20% - 150%)
   const scaleSlider = document.getElementById('web-scale-slider') as HTMLInputElement | null;
@@ -444,7 +641,7 @@ function initPlayground(): void {
     }
     if (btnAutoDemo) {
       btnAutoDemo.classList.remove('active');
-      btnAutoDemo.textContent = '▶ 自动演示';
+      btnAutoDemo.textContent = i18n.fmt.autoDemoBtn(false);
     }
   };
 
@@ -467,10 +664,20 @@ function initPlayground(): void {
     autoDemoRunning = true;
     if (btnAutoDemo) {
       btnAutoDemo.classList.add('active');
-      btnAutoDemo.textContent = '⏸ 停止演示';
+      btnAutoDemo.textContent = i18n.fmt.autoDemoBtn(true);
     }
     autoDemoTimer = window.setTimeout(runDemoTick, 240);
   };
+
+  localeListeners.push(() => {
+    syncSkinLabels();
+    syncTailUI();
+    syncSoundBtn();
+    syncPrivacyState();
+    if (btnAutoDemo) {
+      btnAutoDemo.textContent = i18n.fmt.autoDemoBtn(autoDemoRunning);
+    }
+  });
 
   if (btnAutoDemo) {
     btnAutoDemo.addEventListener('click', () => {
@@ -507,25 +714,54 @@ function initPlayground(): void {
     const vk = keyboardEventToVk(e);
     if (vk !== null) {
       if (autoDemoRunning) stopAutoDemo();
+      if (tailPickerOpen) {
+        if (['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+          e.preventDefault();
+        }
+        if (!e.repeat) {
+          const spec = resolveKeyByVk(vk, currentLayout);
+          if (spec) {
+            toggleWebTailKey(spec.id, spec.bubble || spec.label);
+          }
+        }
+        return;
+      }
       engine.onKeyDown(vk, e.repeat);
     }
   });
 
   window.addEventListener('keyup', (e) => {
+    if (tailPickerOpen) return;
     const vk = keyboardEventToVk(e);
     if (vk !== null) {
       engine.onKeyUp(vk);
     }
   });
 
-  // Real mouse move / petting / eye-tracking / L/R/M clicks on stage
-  viewport.addEventListener('pointermove', (e) => {
+  // Full-window silky eye tracking + stage-scoped mouse move & petting (zero snap-back at canvas border!)
+  window.addEventListener('pointermove', (e) => {
     const rect = viewport.getBoundingClientRect();
-    const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
-    const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
-    engine.onGlobalMouseMove(nx, ny);
+    if (rect.width < 4 || rect.height < 4) return;
+    const insideViewport =
+      e.clientX >= rect.left &&
+      e.clientX <= rect.right &&
+      e.clientY >= rect.top &&
+      e.clientY <= rect.bottom;
 
-    // Map stage coordinates into cat logical coordinates for accurate head petting
+    if (tailPickerOpen) {
+      if (insideViewport) {
+        const hit = engine.hitTestKeyAtClientPoint(e.clientX, e.clientY);
+        engine.setTailPickerHover(hit ? hit.id : null);
+        viewport.classList.toggle('tail-key-hover', Boolean(hit));
+      } else {
+        engine.setTailPickerHover(null);
+        viewport.classList.remove('tail-key-hover');
+      }
+      viewport.classList.remove('petting');
+      return;
+    }
+
+    // Map cursor across the ENTIRE webpage smoothly into cat logical space so eyes track seamlessly everywhere!
     const { w: lw, h: lh } = engine.getLogicalSize();
     const fit = Math.min((rect.width * 0.86) / lw, (rect.height * 0.86) / lh);
     const drawW = lw * fit;
@@ -535,19 +771,37 @@ function initPlayground(): void {
     const relX = (e.clientX - rect.left - ox) / Math.max(1, drawW);
     const relY = (e.clientY - rect.top - oy) / Math.max(1, drawH);
 
-    // Cat head/body zone in normalized logical space
-    const overHead = relX >= 0.30 && relX <= 0.72 && relY >= 0.14 && relY <= 0.52;
+    // Cat head/body zone for intentional head petting (only inside the canvas stage)
+    const overHead =
+      insideViewport && relX >= 0.30 && relX <= 0.72 && relY >= 0.14 && relY <= 0.52;
     viewport.classList.toggle('petting', overHead);
     engine.onWindowCursor(relX, relY, overHead);
+    // Feed consistent CSS-pixel/1440 speed across the ENTIRE browser window so laser-pointer Curious mode works anywhere (~1325 px/s)
+    engine.onPointerSpeedSample(e.clientX / 1440, e.clientY / 1440);
+
+    if (insideViewport) {
+      const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width)));
+      const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / Math.max(1, rect.height)));
+      engine.onGlobalMouseMove(nx, ny);
+    }
   });
 
   viewport.addEventListener('pointerleave', () => {
     viewport.classList.remove('petting');
-    engine.onWindowCursor(0.5, 0.5, false);
+    viewport.classList.remove('tail-key-hover');
+    engine.setTailPickerHover(null);
   });
 
   viewport.addEventListener('pointerdown', (e) => {
     if (autoDemoRunning) stopAutoDemo();
+    if (tailPickerOpen && e.button === 0) {
+      const hit = engine.hitTestKeyAtClientPoint(e.clientX, e.clientY);
+      if (hit) {
+        e.preventDefault();
+        toggleWebTailKey(hit.id, hit.bubble || hit.label);
+        return;
+      }
+    }
     const btnName = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
     engine.onMouseDown(btnName);
   });
@@ -570,34 +824,21 @@ function initPlayground(): void {
 }
 
 function initMcpCodeTabs(): void {
-  const snippets: Record<string, { raw: string; html: string }> = {
-    win: {
-      raw: `{\n  "mcpServers": {\n    "kurocat": {\n      "command": "C:\\\\Users\\\\<你的用户名>\\\\AppData\\\\Local\\\\KuroCat\\\\KuroCat.exe",\n      "args": ["--mcp"]\n    }\n  }\n}`,
-      html: `<span class="c-dim">// Windows Stdio 模式（Claude / Cursor / Antigravity 通用）</span>\n{\n  <span class="c-key">"mcpServers"</span>: {\n    <span class="c-key">"kurocat"</span>: {\n      <span class="c-key">"command"</span>: <span class="c-str">"C:\\\\Users\\\\&lt;你的用户名&gt;\\\\AppData\\\\Local\\\\KuroCat\\\\KuroCat.exe"</span>,\n      <span class="c-key">"args"</span>: [<span class="c-str">"--mcp"</span>]\n    }\n  }\n}`,
-    },
-    mac: {
-      raw: `{\n  "mcpServers": {\n    "kurocat": {\n      "command": "/Applications/KuroCat.app/Contents/MacOS/KuroCat",\n      "args": ["--mcp"]\n    }\n  }\n}`,
-      html: `<span class="c-dim">// macOS Stdio 模式（零依赖直连 App 内置二进制）</span>\n{\n  <span class="c-key">"mcpServers"</span>: {\n    <span class="c-key">"kurocat"</span>: {\n      <span class="c-key">"command"</span>: <span class="c-str">"/Applications/KuroCat.app/Contents/MacOS/KuroCat"</span>,\n      <span class="c-key">"args"</span>: [<span class="c-str">"--mcp"</span>]\n    }\n  }\n}`,
-    },
-    http: {
-      raw: `{\n  "mcpServers": {\n    "kurocat": {\n      "url": "http://127.0.0.1:27420/mcp"\n    }\n  }\n}`,
-      html: `<span class="c-dim">// 本机 Streamable HTTP 模式（桌宠运行时直接连接）</span>\n{\n  <span class="c-key">"mcpServers"</span>: {\n    <span class="c-key">"kurocat"</span>: {\n      <span class="c-key">"url"</span>: <span class="c-str">"http://127.0.0.1:27420/mcp"</span>\n    }\n  }\n}`,
-    },
-  };
-
-  let active = 'win';
+  let active: 'win' | 'mac' | 'http' = 'win';
   const codeEl = document.getElementById('mcp-code');
   const copyBtn = document.getElementById('copy-mcp-btn');
 
-  const render = (key: string) => {
+  const render = (key: 'win' | 'mac' | 'http') => {
     active = key;
-    if (codeEl) codeEl.innerHTML = snippets[key].html;
+    if (codeEl) codeEl.innerHTML = i18n.mcpSnippets[key].html;
   };
   render('win');
+  localeListeners.push(() => render(active));
 
   document.querySelectorAll('[data-mcp-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const key = (btn as HTMLElement).dataset.mcpTab || 'win';
+      const raw = (btn as HTMLElement).dataset.mcpTab;
+      const key: 'win' | 'mac' | 'http' = raw === 'mac' || raw === 'http' ? raw : 'win';
       document.querySelectorAll('[data-mcp-tab]').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       render(key);
@@ -606,10 +847,10 @@ function initMcpCodeTabs(): void {
 
   if (copyBtn) {
     copyBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(snippets[active].raw).then(() => {
-        copyBtn.textContent = '已复制 ✓';
+      navigator.clipboard.writeText(i18n.mcpSnippets[active].raw).then(() => {
+        copyBtn.textContent = i18n.fmt.copied();
         window.setTimeout(() => {
-          copyBtn.textContent = '复制配置';
+          copyBtn.textContent = i18n.fmt.copyConfig();
         }, 1600);
       });
     });
@@ -619,10 +860,10 @@ function initMcpCodeTabs(): void {
   const xattrBtn = document.getElementById('copy-xattr-btn');
   if (xattrBtn) {
     xattrBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText('xattr -cr /Applications/KuroCat.app').then(() => {
-        xattrBtn.textContent = '已复制 ✓';
+      navigator.clipboard.writeText('xattr -cr /Applications/KuroCat.app && open /Applications/KuroCat.app').then(() => {
+        xattrBtn.textContent = i18n.fmt.copied();
         window.setTimeout(() => {
-          xattrBtn.textContent = '复制命令';
+          xattrBtn.textContent = i18n.fmt.copyCmd();
         }, 1600);
       });
     });
@@ -635,9 +876,9 @@ function initMcpCodeTabs(): void {
       const em = chip.querySelector('em');
       navigator.clipboard.writeText(prompt).then(() => {
         if (em) {
-          em.textContent = '已复制 ✓';
+          em.textContent = i18n.fmt.copied();
           window.setTimeout(() => {
-            em.textContent = '复制';
+            em.textContent = i18n.fmt.copyShort();
           }, 1500);
         }
       });
@@ -676,9 +917,22 @@ function initPolish(): void {
   }
 }
 
+function initLanguageSwitcher(): void {
+  document.querySelectorAll<HTMLButtonElement>('[data-lang]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.lang;
+      if (lang === 'zh' || lang === 'en' || lang === 'ja') {
+        setLocale(lang, true);
+      }
+    });
+  });
+}
+
 applyReleaseUI(LOCAL_MIRROR_VERSION, buildDefaultAssets());
 initDownloadTracking();
 initPlayground();
 initMcpCodeTabs();
+initLanguageSwitcher();
+setLocale(currentLocale, false);
 initPolish();
 void syncGithubMetadata();

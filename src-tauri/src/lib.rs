@@ -3,21 +3,32 @@
 mod cats;
 mod config;
 mod input_hook;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod mcp;
+mod obs;
 mod privacy;
 mod tray;
 mod updater;
+#[cfg(windows)]
+mod win7_layered;
+#[cfg(windows)]
+mod windows_display;
+
+#[cfg(windows)]
+const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
 
 use cats::{all_cats, cat_exists, cats_path, sanitize_cat_id, CatSkinConfig};
 use config::{
     config_path, load_settings, normalize_keyboard_layout, normalize_keyboard_orientation,
-    save_settings, set_windows_autostart, AppSettings,
+    normalize_tail_key_ids, normalize_tail_key_mode, save_settings, set_windows_autostart,
+    AppSettings,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, Size, State};
+use tauri::{AppHandle, Emitter, Listener, LogicalSize, Manager, PhysicalPosition, Size, State};
 
 pub const BASE_WIDTH: f64 = 420.0;
 pub const BASE_HEIGHT: f64 = 440.0;
@@ -49,23 +60,148 @@ fn resize_window_anchored_bottom_right(
     scale: f64,
 ) -> Option<(i32, i32)> {
     let (new_w, new_h) = window_dimensions(layout, scale);
-    let old_pos = win.outer_position().ok();
-    let old_size = win.outer_size().ok();
+    #[cfg(target_os = "macos")]
+    if win
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .display_id
+        .is_some()
+    {
+        macos_window::resize_pinned(win, new_w, new_h);
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        let preferred = win
+            .state::<AppState>()
+            .settings
+            .lock()
+            .unwrap()
+            .windows_display_id
+            .clone();
+        if let Some(id) = preferred.as_deref() {
+            return windows_display::resize_pinned(win, id, new_w, new_h);
+        }
+    }
     let sf = win.scale_factor().unwrap_or(1.0);
 
+    #[cfg(windows)]
+    if win_needs_win7_ulw() {
+        let old_rect = win7_layered::get_rect();
+        let _ = win.set_size(Size::Logical(LogicalSize::new(new_w, new_h)));
+        let new_pw = (new_w * sf).round() as i32;
+        let new_ph = (new_h * sf).round() as i32;
+        if let Some((ox, oy, ow, oh)) = old_rect {
+            let new_x = ox + ow - new_pw;
+            let new_y = oy + oh - new_ph;
+            if new_x != ox || new_y != oy {
+                win7_layered::set_position(new_x, new_y);
+            }
+            if win7_layered::is_overlay_active() {
+                let _ = win.set_position(PhysicalPosition::new(new_x, new_y));
+            } else {
+                let _ = win.set_position(PhysicalPosition::new(
+                    WIN7_OFFSCREEN_PARK_POS,
+                    WIN7_OFFSCREEN_PARK_POS,
+                ));
+            }
+            return Some((new_x, new_y));
+        }
+        return None;
+    }
+
+    let old_pos = win.outer_position().ok();
+    let old_size = win.outer_size().ok();
     let _ = win.set_size(Size::Logical(LogicalSize::new(new_w, new_h)));
 
     if let (Some(pos), Some(sz)) = (old_pos, old_size) {
         let new_pw = (new_w * sf).round() as i32;
         let new_ph = (new_h * sf).round() as i32;
-        let new_x = (pos.x + sz.width as i32 - new_pw).max(0);
-        let new_y = (pos.y + sz.height as i32 - new_ph).max(0);
+        let (new_x, new_y) = (
+            pos.x + sz.width as i32 - new_pw,
+            pos.y + sz.height as i32 - new_ph,
+        );
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let (new_x, new_y) = (new_x.max(0), new_y.max(0));
         if new_x != pos.x || new_y != pos.y {
             let _ = win.set_position(PhysicalPosition::new(new_x, new_y));
         }
         return Some((new_x, new_y));
     }
     None
+}
+
+pub fn is_pet_visible(app: &AppHandle) -> bool {
+    #[cfg(windows)]
+    if win_needs_win7_ulw() {
+        return win7_layered::is_visible();
+    }
+    app.get_webview_window("main")
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(true)
+}
+
+pub fn set_pet_visible(app: &AppHandle, visible: bool) {
+    let on_top = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .always_on_top;
+
+    #[cfg(windows)]
+    if win_needs_win7_ulw() {
+        win7_layered::set_visible(visible);
+        if !visible {
+            let _ = app.emit("kuro-win7-close-menu", ());
+            win7_layered::set_overlay_active(false);
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.set_position(PhysicalPosition::new(
+                    WIN7_OFFSCREEN_PARK_POS,
+                    WIN7_OFFSCREEN_PARK_POS,
+                ));
+            }
+        } else if on_top {
+            win7_layered::reassert_topmost();
+        }
+        let _ = app.emit("kuro-win7-visibility", visible);
+        return;
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        if visible {
+            let _ = win.show();
+            #[cfg(windows)]
+            if on_top {
+                win_gentle_reassert_topmost(&win);
+            }
+        } else {
+            let _ = win.hide();
+        }
+    }
+}
+
+pub fn set_pet_always_on_top(app: &AppHandle, on_top: bool) {
+    #[cfg(windows)]
+    if win_needs_win7_ulw() {
+        win7_layered::set_always_on_top(on_top);
+    }
+    if let Some(win) = app.get_webview_window("main") {
+        #[cfg(target_os = "macos")]
+        macos_window::configure_fullscreen(&win, on_top);
+        #[cfg(not(target_os = "macos"))]
+        let _ = win.set_always_on_top(on_top);
+    }
+}
+
+pub fn shutdown_pet_windows() {
+    obs::shutdown_obs_server();
+    #[cfg(windows)]
+    if win_needs_win7_ulw() {
+        win7_layered::shutdown();
+    }
 }
 
 pub fn run_mcp_stdio() {
@@ -75,6 +211,8 @@ pub fn run_mcp_stdio() {
 pub struct AppState {
     pub settings: Arc<Mutex<AppSettings>>,
     pub menu_open: Arc<AtomicBool>,
+    pub menu_creating: Arc<AtomicBool>,
+    pub menu_opened_at: Arc<Mutex<Instant>>,
     pub dragging: Arc<AtomicBool>,
     pub mcp_enabled: Arc<AtomicBool>,
     pub update_banner_open: Arc<AtomicBool>,
@@ -129,14 +267,27 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
         "black".to_string()
     };
     if patch.mcp_port == 0 {
-        patch.mcp_port = 27420;
+        patch.mcp_port = config::default_mcp_port();
+    }
+    if patch.obs_port == 0 {
+        patch.obs_port = config::default_obs_port();
+    }
+    if !patch.obs_enabled {
+        patch.obs_hide_pet = false;
     }
     patch.keyboard_layout = normalize_keyboard_layout(&patch.keyboard_layout);
     patch.keyboard_orientation = normalize_keyboard_orientation(&patch.keyboard_orientation);
+    patch.tail_key_mode = normalize_tail_key_mode(&patch.tail_key_mode);
+    patch.tail_key_ids = normalize_tail_key_ids(&patch.tail_key_ids);
 
-    let (prev_autostart, prev_scale, prev_layout) = {
+    let (prev_autostart, prev_scale, prev_layout, prev_obs_hide) = {
         let s = state.settings.lock().unwrap();
-        (s.autostart, s.scale, s.keyboard_layout.clone())
+        (
+            s.autostart,
+            s.scale,
+            s.keyboard_layout.clone(),
+            s.obs_enabled && s.obs_hide_pet,
+        )
     };
     if config::TRACKPAD_PREVIEW {
         patch.autostart = false;
@@ -145,12 +296,16 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
     }
 
     state.mcp_enabled.store(patch.mcp_enabled, Ordering::Relaxed);
+    obs::sync_obs_server(&app, patch.obs_enabled, patch.obs_port);
+
+    let next_obs_hide = patch.obs_enabled && patch.obs_hide_pet;
+    if next_obs_hide != prev_obs_hide && !state.paused_guard.load(Ordering::Relaxed) {
+        set_pet_visible(&app, !next_obs_hide);
+    }
 
     let size_changed = (patch.scale - prev_scale).abs() > 0.005 || patch.keyboard_layout != prev_layout;
+    set_pet_always_on_top(&app, patch.always_on_top);
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.set_always_on_top(patch.always_on_top);
-        #[cfg(target_os = "macos")]
-        configure_macos_fullscreen_overlay(&win, patch.always_on_top);
         if size_changed {
             if let Some((nx, ny)) =
                 resize_window_anchored_bottom_right(&win, &patch.keyboard_layout, patch.scale)
@@ -163,11 +318,298 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
 
     {
         let mut s = state.settings.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // Display placement is changed by the native menu and window drag, not by web settings.
+            patch.display_id = s.display_id.clone();
+            if patch.display_id.is_some() || !size_changed {
+                patch.x = s.x;
+                patch.y = s.y;
+            }
+        }
+        #[cfg(windows)]
+        {
+            patch.windows_display_id = s.windows_display_id.clone();
+            if !size_changed {
+                patch.x = s.x;
+                patch.y = s.y;
+            }
+        }
         *s = patch.clone();
         save_settings(&s);
     }
     let _ = app.emit("kuro-settings", patch.clone());
+    if size_changed {
+        reposition_context_menu_if_open(&app);
+    }
     patch
+}
+
+const SIDE_MENU_LOGICAL_W: f64 = 266.0;
+
+/// Computes a non-overlapping physical position `(mx, my)` for the floating menu popover
+/// beside the cat window: prefers LEFT (since the cat defaults to bottom-right), then RIGHT,
+/// then ABOVE, never covering the cat when screen space allows.
+fn compute_side_menu_pos(
+    pet_rect: (i32, i32, i32, i32),
+    work_area: (i32, i32, i32, i32),
+    menu_size: (i32, i32),
+    gap: i32,
+    pad: i32,
+) -> (i32, i32) {
+    let (px, py, pw, ph) = pet_rect;
+    let (wx, wy, ww, wh) = work_area;
+    let (mw, mh) = menu_size;
+
+    let min_x = wx + pad;
+    let max_x = (wx + ww - mw - pad).max(min_x);
+    let min_y = wy + pad;
+    let max_y = (wy + wh - mh - pad).max(min_y);
+
+    let space_left = (px - gap) - min_x;
+    let space_right = (wx + ww - pad) - (px + pw + gap);
+
+    if space_left >= mw {
+        let mx = px - mw - gap;
+        let my = (py + ph - mh).clamp(min_y, max_y);
+        return (mx.clamp(min_x, max_x), my);
+    }
+    if space_right >= mw {
+        let mx = px + pw + gap;
+        let my = (py + ph - mh).clamp(min_y, max_y);
+        return (mx.clamp(min_x, max_x), my);
+    }
+
+    // Tight horizontal screen fallback: try placing directly above the cat
+    let space_above = (py - gap) - min_y;
+    if space_above >= mh {
+        let mx = (px + (pw - mw) / 2).clamp(min_x, max_x);
+        let my = (py - mh - gap).clamp(min_y, max_y);
+        return (mx, my);
+    }
+
+    // Last resort on very small viewports: pick side with more space, clamped on-screen
+    let mx = if space_left >= space_right { min_x } else { max_x };
+    let my = (py + ph - mh).clamp(min_y, max_y);
+    (mx, my)
+}
+
+fn current_pet_rect_and_monitor(app: &AppHandle) -> Option<((i32, i32, i32, i32), (i32, i32, i32, i32), f64)> {
+    let main_win = app.get_webview_window("main")?;
+    let sf = main_win.scale_factor().unwrap_or(1.0);
+
+    #[cfg(windows)]
+    let pet_rect = if win_needs_win7_ulw() {
+        win7_layered::get_rect().map(|(x, y, w, h)| (x, y, w as i32, h as i32))
+    } else {
+        match (main_win.outer_position().ok(), main_win.outer_size().ok()) {
+            (Some(p), Some(sz)) => Some((p.x, p.y, sz.width as i32, sz.height as i32)),
+            _ => None,
+        }
+    };
+    #[cfg(not(windows))]
+    let pet_rect = match (main_win.outer_position().ok(), main_win.outer_size().ok()) {
+        (Some(p), Some(sz)) => Some((p.x, p.y, sz.width as i32, sz.height as i32)),
+        _ => None,
+    };
+
+    let pet_rect = pet_rect?;
+    let monitor = main_win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| main_win.primary_monitor().ok().flatten());
+
+    let work_area = if let Some(mon) = monitor {
+        let mp = mon.position();
+        let ms = mon.size();
+        let taskbar_margin = (46.0 * sf).round() as i32;
+        (mp.x, mp.y, ms.width as i32, (ms.height as i32 - taskbar_margin).max(320))
+    } else {
+        (0, 0, (1920.0 * sf).round() as i32, (1030.0 * sf).round() as i32)
+    };
+
+    Some((pet_rect, work_area, sf))
+}
+
+fn side_menu_geometry(app: &AppHandle) -> Option<(i32, i32, f64, f64)> {
+    let (pet_rect, work_area, sf) = current_pet_rect_and_monitor(app)?;
+    let mon_logical_h = work_area.3 as f64 / sf.max(0.5);
+    let menu_logical_h = (mon_logical_h - 24.0).clamp(360.0, 650.0);
+    let mw = (SIDE_MENU_LOGICAL_W * sf).round() as i32;
+    let mh = (menu_logical_h * sf).round() as i32;
+    let gap = (10.0 * sf).round() as i32;
+    let pad = (10.0 * sf).round() as i32;
+    let (mx, my) = compute_side_menu_pos(pet_rect, work_area, (mw, mh), gap, pad);
+    Some((mx, my, SIDE_MENU_LOGICAL_W, menu_logical_h))
+}
+
+fn reposition_context_menu_if_open(app: &AppHandle) {
+    let Some(menu_win) = app.get_webview_window("menu") else {
+        return;
+    };
+    if !menu_win.is_visible().unwrap_or(false) {
+        return;
+    }
+    if let Some((mx, my, lw, lh)) = side_menu_geometry(app) {
+        let _ = menu_win.set_size(Size::Logical(LogicalSize::new(lw, lh)));
+        let _ = menu_win.set_position(PhysicalPosition::new(mx, my));
+    }
+}
+
+#[cfg(windows)]
+fn win_is_menu_still_focused(menu_win: &tauri::WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsChild};
+    let Ok(raw_hwnd) = menu_win.hwnd() else {
+        return false;
+    };
+    let menu_hwnd = raw_hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    if menu_hwnd.is_null() {
+        return false;
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.is_null() {
+        return false;
+    }
+    fg == menu_hwnd || unsafe { IsChild(menu_hwnd, fg) != 0 }
+}
+
+/// IMPORTANT: Must be `async fn` so Tauri executes it off the Windows UI main thread!
+/// Calling `WebviewWindowBuilder::build()` inside a synchronous `#[tauri::command]`
+/// deadlocks the Windows WebView2 / tao event loop (freezing right-click, left-drag, and tray exit).
+#[tauri::command]
+async fn open_context_menu(app: AppHandle) -> Result<(), String> {
+    let Some((mx, my, lw, lh)) = side_menu_geometry(&app) else {
+        return Err("side_menu_geometry returned None".into());
+    };
+
+    struct ResetFlag(Arc<AtomicBool>);
+    impl Drop for ResetFlag {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    let menu_win = if let Some(existing) = app.get_webview_window("menu") {
+        existing
+    } else {
+        let creating_flag = app.state::<AppState>().menu_creating.clone();
+        if creating_flag
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _reset_guard = ResetFlag(creating_flag);
+
+        // Re-check after acquiring creation guard in case a concurrent call just finished.
+        if let Some(existing) = app.get_webview_window("menu") {
+            existing
+        } else {
+            #[cfg(windows)]
+            let use_transparent = !win_needs_win7_ulw();
+            #[cfg(not(windows))]
+            let use_transparent = true;
+
+            let created = match tauri::WebviewWindowBuilder::new(
+                &app,
+                "menu",
+                tauri::WebviewUrl::App("menu.html".into()),
+            )
+            .title("KuroCat Menu")
+            .inner_size(lw, lh)
+            .decorations(false)
+            .resizable(false)
+            .transparent(use_transparent)
+            .shadow(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(false)
+            // MUST match `tauri.conf.json` main window's `additionalBrowserArgs` identically;
+            // otherwise Windows WebView2 rejects creating a 2nd window in the same userDataFolder
+            // with HRESULT 0x8007139F (ERROR_INVALID_STATE)!
+            .additional_browser_args("--autoplay-policy=no-user-gesture-required")
+            .build()
+            {
+                Ok(w) => w,
+                Err(err) => {
+                    eprintln!("[kurocat] open_context_menu: failed to build menu window: {err}");
+                    return Err(err.to_string());
+                }
+            };
+
+            let app_ev = app.clone();
+            created.on_window_event(move |event| match event {
+                tauri::WindowEvent::Focused(false) => {
+                    let state = app_ev.state::<AppState>();
+                    let elapsed = state.menu_opened_at.lock().unwrap().elapsed();
+                    if elapsed >= Duration::from_millis(360) {
+                        if let Some(w) = app_ev.get_webview_window("menu") {
+                            #[cfg(windows)]
+                            if win_is_menu_still_focused(&w) {
+                                return;
+                            }
+                            let _ = w.hide();
+                        }
+                        state.menu_open.store(false, Ordering::Relaxed);
+                    }
+                }
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    if let Some(w) = app_ev.get_webview_window("menu") {
+                        let _ = w.hide();
+                    }
+                    app_ev
+                        .state::<AppState>()
+                        .menu_open
+                        .store(false, Ordering::Relaxed);
+                }
+                _ => {}
+            });
+            created
+        }
+    };
+
+    let state = app.state::<AppState>();
+    *state.menu_opened_at.lock().unwrap() = Instant::now();
+    state.menu_open.store(true, Ordering::Relaxed);
+
+    let _ = menu_win.set_size(Size::Logical(LogicalSize::new(lw, lh)));
+    let _ = menu_win.set_position(PhysicalPosition::new(mx, my));
+    let _ = menu_win.set_always_on_top(true);
+    let _ = menu_win.show();
+    let _ = menu_win.set_focus();
+    let _ = app.emit("kuro-menu-opened", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn close_context_menu(app: AppHandle) {
+    if let Some(menu_win) = app.get_webview_window("menu") {
+        let _ = menu_win.hide();
+    }
+    app.state::<AppState>()
+        .menu_open
+        .store(false, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn open_tail_picker_from_menu(app: AppHandle) {
+    close_context_menu(app.clone());
+    set_pet_visible(&app, true);
+    let _ = app.emit("kuro-open-tail-picker", ());
+}
+
+#[tauri::command]
+fn preview_scale(app: AppHandle, scale: f64) {
+    let clamped = scale.clamp(0.20, 1.50);
+    let _ = app.emit("kuro-scale-preview", clamped);
+}
+
+#[tauri::command]
+fn get_obs_url(state: State<'_, AppState>) -> String {
+    let port = state.settings.lock().unwrap().obs_port;
+    obs::obs_url(port)
 }
 
 #[tauri::command]
@@ -220,6 +662,55 @@ fn open_release_page(url: String) {
 }
 
 #[tauri::command]
+#[cfg(windows)]
+fn save_window_pos(app: AppHandle) {
+    if win_needs_win7_ulw() {
+        if let Some((x, y, _, _)) = win7_layered::get_rect() {
+            windows_display::remember_dragged_position(&app, PhysicalPosition::new(x, y));
+        }
+    } else if let Some(position) = app
+        .get_webview_window("main")
+        .and_then(|win| win.outer_position().ok())
+    {
+        windows_display::remember_dragged_position(&app, position);
+    }
+}
+
+#[tauri::command]
+#[cfg(target_os = "macos")]
+fn save_window_pos(app: AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window("main") else {
+            return;
+        };
+        let Ok(position) = win.outer_position() else {
+            return;
+        };
+        let state = handle.state::<AppState>();
+        let unpinned = {
+            let mut settings = state.settings.lock().unwrap();
+            let unpinned = settings
+                .display_id
+                .as_deref()
+                .is_some_and(|id| !macos_window::is_at_display_corner(&win, id));
+            if unpinned {
+                settings.display_id = None;
+            }
+            settings.x = Some(position.x);
+            settings.y = Some(position.y);
+            save_settings(&settings);
+            unpinned.then(|| settings.clone())
+        };
+        if let Some(settings) = unpinned {
+            let _ = macos_window::refresh_menu(&handle);
+            let _ = handle.emit("kuro-settings", settings);
+        }
+    });
+}
+
+#[tauri::command]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn save_window_pos(app: AppHandle, state: State<'_, AppState>) {
     if let Some(win) = app.get_webview_window("main") {
         if let Ok(pos) = win.outer_position() {
@@ -243,6 +734,7 @@ fn create_desktop_shortcut() -> Result<String, String> {
 
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    shutdown_pet_windows();
     app.exit(0);
 }
 
@@ -264,26 +756,46 @@ pub fn apply_breed_and_save(app: &AppHandle, breed: &str) {
 }
 
 pub fn reload_and_emit_all(app: &AppHandle) {
-    let disk_settings = load_settings();
     let cats = all_cats();
     let state = app.state::<AppState>();
 
-    let (size_changed, top_changed) = {
+    let (disk_settings, size_changed, top_changed, display_changed) = {
         let mut s = state.settings.lock().unwrap();
+        let disk_settings = load_settings();
         let sc = (s.scale - disk_settings.scale).abs() > 0.01
             || s.keyboard_layout != disk_settings.keyboard_layout;
         let tc = s.always_on_top != disk_settings.always_on_top;
+        #[cfg(target_os = "macos")]
+        let display_changed = s.display_id != disk_settings.display_id;
+        #[cfg(windows)]
+        let display_changed = s.windows_display_id != disk_settings.windows_display_id;
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let display_changed = false;
         *s = disk_settings.clone();
-        (sc, tc)
+        (disk_settings, sc, tc, display_changed)
     };
     state
         .mcp_enabled
         .store(disk_settings.mcp_enabled, Ordering::Relaxed);
 
+    if top_changed {
+        set_pet_always_on_top(app, disk_settings.always_on_top);
+    }
+    #[cfg(target_os = "macos")]
+    if display_changed {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            macos_window::restore_pinned_position(&handle);
+            let _ = macos_window::refresh_menu(&handle);
+        });
+    }
+    #[cfg(windows)]
+    if display_changed {
+        windows_display::refresh_placement(app);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let _ = display_changed;
     if let Some(win) = app.get_webview_window("main") {
-        if top_changed {
-            let _ = win.set_always_on_top(disk_settings.always_on_top);
-        }
         if size_changed {
             let _ = resize_window_anchored_bottom_right(
                 &win,
@@ -373,12 +885,72 @@ pub fn apply_keyboard_orientation_and_save(app: &AppHandle, orientation: &str) {
     let _ = app.emit("kuro-settings", updated);
 }
 
+pub fn apply_tail_key_mode_and_save(app: &AppHandle, mode: &str) {
+    let normalized = normalize_tail_key_mode(mode);
+    let state = app.state::<AppState>();
+    let updated = {
+        let mut s = state.settings.lock().unwrap();
+        s.tail_key_mode = normalized;
+        save_settings(&s);
+        s.clone()
+    };
+    let _ = app.emit("kuro-settings", updated);
+}
+
+#[cfg(target_os = "macos")]
+pub fn reset_window_position(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window("main") else {
+            return;
+        };
+        let state = handle.state::<AppState>();
+        let mut settings = state.settings.lock().unwrap();
+        if macos_window::place(&win, settings.display_id.as_deref()) {
+            if let Ok(position) = win.outer_position() {
+                settings.x = Some(position.x);
+                settings.y = Some(position.y);
+                save_settings(&settings);
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn reset_window_position(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        #[cfg(windows)]
+        if windows_display::reset_position(app, &win) {
+            return;
+        }
         let size = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
         let sf = win.scale_factor().unwrap_or(1.0);
-        let (target_x, target_y) = default_bottom_right_position(size.width as i32, size.height as i32, sf);
-        let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+        #[cfg(windows)]
+        let (w_px, h_px) = if win_needs_win7_ulw() {
+            win7_layered::get_rect()
+                .map(|(_, _, w, h)| (w, h))
+                .unwrap_or((size.width as i32, size.height as i32))
+        } else {
+            (size.width as i32, size.height as i32)
+        };
+        #[cfg(not(windows))]
+        let (w_px, h_px) = (size.width as i32, size.height as i32);
+
+        let (target_x, target_y) = default_bottom_right_position(w_px, h_px, sf);
+        #[cfg(windows)]
+        if win_needs_win7_ulw() {
+            win7_layered::set_position(target_x, target_y);
+            if win7_layered::is_overlay_active() {
+                let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+            }
+        } else {
+            let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+        }
+
         let state = app.state::<AppState>();
         let mut s = state.settings.lock().unwrap();
         s.x = Some(target_x);
@@ -397,17 +969,13 @@ fn default_bottom_right_position(win_w: i32, win_h: i32, _scale_factor: f64) -> 
     }
 }
 
-#[cfg(target_os = "macos")]
-fn default_bottom_right_position(win_w: i32, win_h: i32, scale_factor: f64) -> (i32, i32) {
-    let (sw_pt, sh_pt) = input_hook::macos_hook::main_display_size();
-    let sw = (sw_pt * scale_factor).round() as i32;
-    let sh = (sh_pt * scale_factor).round() as i32;
-    let pad_x = (28.0 * scale_factor).round() as i32;
-    let pad_y = (84.0 * scale_factor).round() as i32;
-    ((sw - win_w - pad_x).max(20), (sh - win_h - pad_y).max(20))
+#[cfg(target_os = "linux")]
+fn default_bottom_right_position(win_w: i32, win_h: i32, _scale_factor: f64) -> (i32, i32) {
+    let (sw, sh) = input_hook::linux_hook::primary_screen_size();
+    ((sw - win_w - 28).max(20), (sh - win_h - 68).max(20))
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn default_bottom_right_position(_win_w: i32, _win_h: i32, _scale_factor: f64) -> (i32, i32) {
     (900, 500)
 }
@@ -436,7 +1004,12 @@ fn get_cursor_pos(scale_factor: f64) -> Option<(i32, i32)> {
     })
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn get_cursor_pos(_scale_factor: f64) -> Option<(i32, i32)> {
+    input_hook::linux_hook::cursor_pos()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn get_cursor_pos(_scale_factor: f64) -> Option<(i32, i32)> {
     None
 }
@@ -461,10 +1034,15 @@ fn win_force_click_through(win: &tauri::WebviewWindow, ignore: bool) {
         return;
     };
     let hwnd = raw_hwnd.0 as windows_sys::Win32::Foundation::HWND;
+    let is_win7 = win_needs_win7_ulw();
     unsafe {
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let new_ex = if ignore {
             ex | (WS_EX_TRANSPARENT as isize) | (WS_EX_LAYERED as isize)
+        } else if is_win7 {
+            // Keep the offscreen/overlay WebView2 HWND free of WS_EX_LAYERED so popup overlays
+            // (context menu / toast) never hit Win7's layered-alpha=0 invisibility quirk.
+            ex & !(WS_EX_TRANSPARENT as isize) & !(WS_EX_LAYERED as isize)
         } else {
             ex & !(WS_EX_TRANSPARENT as isize)
         };
@@ -738,60 +1316,40 @@ fn win_wait_for_previous_pid_if_requested() {
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
-    let mut args = std::env::args();
+    let mut wait_pid: Option<u32> = None;
+    let mut cleanup_old_exe: Option<String> = None;
+
+    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--wait-pid" {
             if let Some(pid_str) = args.next() {
-                if let Ok(pid) = pid_str.parse::<u32>() {
-                    if pid != 0 && pid != std::process::id() {
-                        unsafe {
-                            let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-                            if !handle.is_null() {
-                                let _ = WaitForSingleObject(handle, 4000);
-                                let _ = CloseHandle(handle);
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(150));
-                    }
+                wait_pid = pid_str.parse::<u32>().ok();
+            }
+        } else if arg == "--cleanup-old-exe" {
+            cleanup_old_exe = args.next();
+        }
+    }
+
+    if let Some(pid) = wait_pid {
+        if pid != 0 && pid != std::process::id() {
+            unsafe {
+                let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+                if !handle.is_null() {
+                    let _ = WaitForSingleObject(handle, 5000);
+                    let _ = CloseHandle(handle);
                 }
             }
-            break;
+            std::thread::sleep(Duration::from_millis(150));
         }
     }
-}
 
-#[cfg(target_os = "macos")]
-pub fn configure_macos_fullscreen_overlay(win: &tauri::WebviewWindow, always_on_top: bool) {
-    use std::ffi::{c_char, c_void};
-    #[link(name = "objc")]
-    extern "C" {
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-    if let Ok(raw_ns_win) = win.ns_window() {
-        if raw_ns_win.is_null() {
-            return;
-        }
-        unsafe {
-            let sel_get_behavior =
-                sel_registerName(b"collectionBehavior\0".as_ptr() as *const c_char);
-            let sel_set_behavior =
-                sel_registerName(b"setCollectionBehavior:\0".as_ptr() as *const c_char);
-            let sel_set_level = sel_registerName(b"setLevel:\0".as_ptr() as *const c_char);
-
-            let get_fn: extern "C" fn(*mut c_void, *mut c_void) -> usize =
-                std::mem::transmute(objc_msgSend as *const ());
-            let set_usize_fn: extern "C" fn(*mut c_void, *mut c_void, usize) =
-                std::mem::transmute(objc_msgSend as *const ());
-            let set_isize_fn: extern "C" fn(*mut c_void, *mut c_void, isize) =
-                std::mem::transmute(objc_msgSend as *const ());
-
-            let cur = get_fn(raw_ns_win, sel_get_behavior);
-            // CanJoinAllSpaces (1 << 0) | Stationary (1 << 4) | FullScreenAuxiliary (1 << 8)
-            let next = cur | (1 << 0) | (1 << 4) | (1 << 8);
-            set_usize_fn(raw_ns_win, sel_set_behavior, next);
-            // NSStatusWindowLevel = 25 (floats above native fullscreen apps/games), Normal = 0
-            set_isize_fn(raw_ns_win, sel_set_level, if always_on_top { 25 } else { 0 });
+    if let Some(old_path) = cleanup_old_exe {
+        let path = std::path::PathBuf::from(old_path);
+        for _ in 0..10 {
+            if !path.exists() || std::fs::remove_file(&path).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
@@ -857,23 +1415,45 @@ fn start_hit_test_loop(
             let Some(win) = app.get_webview_window("main") else {
                 continue;
             };
-            if !win.is_visible().unwrap_or(false) {
+            #[cfg(windows)]
+            let is_win7_ulw = win_needs_win7_ulw();
+            #[cfg(not(windows))]
+            let is_win7_ulw = false;
+
+            if is_win7_ulw {
+                #[cfg(windows)]
+                if !win7_layered::is_visible() {
+                    continue;
+                }
+            } else if !win.is_visible().unwrap_or(false) {
                 continue;
             }
             let sf = win.scale_factor().unwrap_or(1.0);
             let Some((cx, cy)) = get_cursor_pos(sf) else {
                 continue;
             };
-            let Ok(pos) = win.outer_position() else {
-                continue;
+
+            let (win_x, win_y, w, h) = if is_win7_ulw {
+                #[cfg(windows)]
+                {
+                    let Some((ux, uy, uw, uh)) = win7_layered::get_rect() else {
+                        continue;
+                    };
+                    (ux, uy, uw.max(1) as f64, uh.max(1) as f64)
+                }
+                #[cfg(not(windows))]
+                unreachable!()
+            } else {
+                let Ok(pos) = win.outer_position() else {
+                    continue;
+                };
+                let Ok(size) = win.outer_size() else {
+                    continue;
+                };
+                (pos.x, pos.y, size.width.max(1) as f64, size.height.max(1) as f64)
             };
-            let Ok(size) = win.outer_size() else {
-                continue;
-            };
-            let w = size.width.max(1) as f64;
-            let h = size.height.max(1) as f64;
-            let rx = (cx - pos.x) as f64 / w;
-            let ry = (cy - pos.y) as f64 / h;
+            let rx = (cx - win_x) as f64 / w;
+            let ry = (cy - win_y) as f64 / h;
             let inside = rx >= 0.0 && rx <= 1.0 && ry >= 0.0 && ry <= 1.0;
             let (locked, always_on_top, is_108, cur_scale, layout_str, viewer_facing, trackpad) = {
                 let s = settings.lock().unwrap();
@@ -908,8 +1488,14 @@ fn start_hit_test_loop(
                 topmost_check_ticks = topmost_check_ticks.saturating_add(1);
                 if topmost_check_ticks >= 6 {
                     topmost_check_ticks = 0;
-                    if let Ok(raw_hwnd) = win.hwnd() {
-                        let our_hwnd = raw_hwnd.0 as windows_sys::Win32::Foundation::HWND;
+                    let our_hwnd_opt = if is_win7_ulw {
+                        win7_layered::hwnd()
+                    } else {
+                        win.hwnd()
+                            .ok()
+                            .map(|h| h.0 as windows_sys::Win32::Foundation::HWND)
+                    };
+                    if let Some(our_hwnd) = our_hwnd_opt {
                         if !win_is_iconic(our_hwnd) {
                             let lost_topmost = !win_is_topmost(our_hwnd);
                             let fg_above = !lost_topmost
@@ -921,14 +1507,18 @@ fn start_hit_test_loop(
                                 fg_above_attempts = 0;
                             } else if lost_topmost {
                                 if last_topmost_reassert.elapsed() >= Duration::from_millis(250) {
-                                    let app_for_top = app.clone();
-                                    let _ = app.run_on_main_thread(move || {
-                                        if let Some(w) = app_for_top.get_webview_window("main") {
-                                            if w.is_visible().unwrap_or(false) {
-                                                win_gentle_reassert_topmost(&w);
+                                    if is_win7_ulw {
+                                        win7_layered::reassert_topmost();
+                                    } else {
+                                        let app_for_top = app.clone();
+                                        let _ = app.run_on_main_thread(move || {
+                                            if let Some(w) = app_for_top.get_webview_window("main") {
+                                                if w.is_visible().unwrap_or(false) {
+                                                    win_gentle_reassert_topmost(&w);
+                                                }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                     last_topmost_reassert = Instant::now();
                                 }
                             } else if fg_above_attempts < 3 {
@@ -938,14 +1528,18 @@ fn start_hit_test_loop(
                                     _ => Duration::from_millis(900),
                                 };
                                 if last_topmost_reassert.elapsed() >= cooldown {
-                                    let app_for_top = app.clone();
-                                    let _ = app.run_on_main_thread(move || {
-                                        if let Some(w) = app_for_top.get_webview_window("main") {
-                                            if w.is_visible().unwrap_or(false) {
-                                                win_gentle_reassert_topmost(&w);
+                                    if is_win7_ulw {
+                                        win7_layered::reassert_topmost();
+                                    } else {
+                                        let app_for_top = app.clone();
+                                        let _ = app.run_on_main_thread(move || {
+                                            if let Some(w) = app_for_top.get_webview_window("main") {
+                                                if w.is_visible().unwrap_or(false) {
+                                                    win_gentle_reassert_topmost(&w);
+                                                }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                     last_topmost_reassert = Instant::now();
                                     fg_above_attempts = fg_above_attempts.saturating_add(1);
                                 }
@@ -982,18 +1576,36 @@ fn start_hit_test_loop(
             // aren't misled by squinting eyes when the cat is intentionally click-through.
             let over_cat = if effective_locked { false } else { raw_over_cat };
 
+            #[cfg(windows)]
+            if is_win7_ulw {
+                win7_layered::set_over_cat(over_cat);
+            }
+
             let over_banner = is_banner && inside && ry <= 0.19;
 
-            let should_ignore = if is_menu || is_drag || over_banner {
+            // The context menu is its own independent OS window ("menu"), so do NOT disable
+            // click-through on "main"'s empty transparent padding when `is_menu` is true.
+            let should_ignore = if is_drag || over_banner {
                 false
             } else if effective_locked {
                 true
+            } else if is_win7_ulw {
+                false
             } else {
                 !over_interactive
             };
 
             if last_ignore != Some(should_ignore) {
-                let _ = win.set_ignore_cursor_events(should_ignore);
+                #[cfg(windows)]
+                if is_win7_ulw {
+                    win7_layered::set_click_through(should_ignore);
+                } else {
+                    let _ = win.set_ignore_cursor_events(should_ignore);
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = win.set_ignore_cursor_events(should_ignore);
+                }
                 last_ignore = Some(should_ignore);
                 #[cfg(windows)]
                 {
@@ -1002,16 +1614,27 @@ fn start_hit_test_loop(
             } else {
                 // Self-heal Windows WS_EX_TRANSPARENT if DWM / Wallpaper Engine / Show-Desktop drifted it
                 #[cfg(windows)]
-                if let Some(actual_transparent) = win_is_click_through(&win) {
-                    if actual_transparent != should_ignore {
-                        drift_ticks = drift_ticks.saturating_add(1);
-                        if drift_ticks >= 4 {
-                            win_force_click_through(&win, should_ignore);
-                            let _ = win.set_ignore_cursor_events(should_ignore);
+                {
+                    let actual_opt = if is_win7_ulw {
+                        win7_layered::is_click_through()
+                    } else {
+                        win_is_click_through(&win)
+                    };
+                    if let Some(actual_transparent) = actual_opt {
+                        if actual_transparent != should_ignore {
+                            drift_ticks = drift_ticks.saturating_add(1);
+                            if drift_ticks >= 4 {
+                                if is_win7_ulw {
+                                    win7_layered::set_click_through(should_ignore);
+                                } else {
+                                    win_force_click_through(&win, should_ignore);
+                                    let _ = win.set_ignore_cursor_events(should_ignore);
+                                }
+                                drift_ticks = 0;
+                            }
+                        } else {
                             drift_ticks = 0;
                         }
-                    } else {
-                        drift_ticks = 0;
                     }
                 }
             }
@@ -1036,6 +1659,190 @@ fn start_hit_test_loop(
             }
         }
     });
+}
+
+#[cfg(windows)]
+fn win_needs_win7_ulw() -> bool {
+    use std::sync::OnceLock;
+    static NEEDS_ULW: OnceLock<bool> = OnceLock::new();
+    *NEEDS_ULW.get_or_init(|| {
+        for var in ["KUROCAT_WIN7_ULW", "KUROCAT_WIN7_MASK"] {
+            if let Ok(v) = std::env::var(var) {
+                let t = v.trim();
+                if t == "1" || t.eq_ignore_ascii_case("true") {
+                    return true;
+                }
+                if t == "0" || t.eq_ignore_ascii_case("false") {
+                    return false;
+                }
+            }
+        }
+        // Query real OS version via ntdll!RtlGetVersion (immune to compatibility manifest lies).
+        // Windows 7 = 6.1, Windows 8 = 6.2, Windows 8.1 = 6.3, Windows 10/11 = 10.0+.
+        #[repr(C)]
+        struct RtlOsVersionInfoW {
+            dw_os_version_info_size: u32,
+            dw_major_version: u32,
+            dw_minor_version: u32,
+            dw_build_number: u32,
+            dw_platform_id: u32,
+            sz_csd_version: [u16; 128],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn RtlGetVersion(lpVersionInformation: *mut RtlOsVersionInfoW) -> i32;
+        }
+        unsafe {
+            let mut info: RtlOsVersionInfoW = std::mem::zeroed();
+            info.dw_os_version_info_size = std::mem::size_of::<RtlOsVersionInfoW>() as u32;
+            if RtlGetVersion(&mut info) == 0 {
+                return info.dw_major_version < 10;
+            }
+        }
+        false
+    })
+}
+
+/// Build a rounded GDI HRGN from `[left, top, right, bottom, corner_radius_px]` tuples
+/// for on-demand DOM overlays (`#context-menu` and `#update-toast`) on Windows 7/8.
+#[cfg(windows)]
+fn build_rounded_overlay_hrgn(rects: &[i32]) -> windows_sys::Win32::Graphics::Gdi::HRGN {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRoundRectRgn, DeleteObject, HRGN, RGN_OR,
+    };
+
+    let mut final_rgn: HRGN = std::ptr::null_mut();
+    for chunk in rects.chunks_exact(5) {
+        let (l, t, r, b, radius) = (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
+        if r <= l || b <= t {
+            continue;
+        }
+        let w = r - l;
+        let h = b - t;
+        let diam = (radius.max(0) * 2).min(w).min(h);
+        unsafe {
+            let ov = CreateRoundRectRgn(l, t, r + 1, b + 1, diam, diam);
+            if ov.is_null() {
+                continue;
+            }
+            if final_rgn.is_null() {
+                final_rgn = ov;
+            } else {
+                CombineRgn(final_rgn, final_rgn, ov, RGN_OR);
+                DeleteObject(ov as _);
+            }
+        }
+    }
+    final_rgn
+}
+
+#[tauri::command]
+fn is_win7_ulw_mode() -> bool {
+    #[cfg(windows)]
+    {
+        return win_needs_win7_ulw();
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn win7_present_frame(request: tauri::ipc::Request<'_>) {
+    #[cfg(windows)]
+    {
+        if !win_needs_win7_ulw() {
+            return;
+        }
+        let w = request
+            .headers()
+            .get("x-w")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        let h = request
+            .headers()
+            .get("x-h")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            return;
+        }
+        if let tauri::ipc::InvokeBody::Raw(bytes) = request.body() {
+            win7_layered::submit_rgba_frame(w, h, bytes);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+    }
+}
+
+#[tauri::command]
+fn win7_sync_overlay(window: tauri::WebviewWindow, rects: Vec<i32>, focus_menu: bool) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, SetWindowRgn};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SetForegroundWindow, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOSIZE,
+            SWP_NOZORDER,
+        };
+        if !win_needs_win7_ulw() {
+            return;
+        }
+        let Ok(raw_hwnd) = window.hwnd() else {
+            return;
+        };
+        let main_hwnd = raw_hwnd.0 as windows_sys::Win32::Foundation::HWND;
+
+        let rgn = build_rounded_overlay_hrgn(&rects);
+        if rgn.is_null() {
+            win7_layered::set_overlay_active(false);
+            unsafe {
+                let _ = SetWindowRgn(main_hwnd, std::ptr::null_mut(), 0);
+                let _ = SetWindowPos(
+                    main_hwnd,
+                    std::ptr::null_mut(),
+                    WIN7_OFFSCREEN_PARK_POS,
+                    WIN7_OFFSCREEN_PARK_POS,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return;
+        }
+
+        // Ensure WebView2 overlay HWND is opaque & clickable on Win7 (no WS_EX_LAYERED/TRANSPARENT)
+        win_force_click_through(&window, false);
+        let Some((ux, uy, _, _)) = win7_layered::get_rect() else {
+            unsafe {
+                DeleteObject(rgn as _);
+            }
+            return;
+        };
+        win7_layered::set_overlay_active(true);
+        unsafe {
+            if SetWindowRgn(main_hwnd, rgn, 1) == 0 {
+                DeleteObject(rgn as _);
+            }
+            let flags = if focus_menu {
+                SWP_NOSIZE
+            } else {
+                SWP_NOSIZE | SWP_NOACTIVATE
+            };
+            let _ = SetWindowPos(main_hwnd, HWND_TOPMOST, ux, uy, 0, 0, flags);
+            if focus_menu {
+                let _ = SetForegroundWindow(main_hwnd);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, rects, focus_menu);
+    }
 }
 
 #[cfg(windows)]
@@ -1069,6 +1876,46 @@ fn win_configure_local_webview2_runtime() {
         let _ = std::fs::create_dir_all(&udf);
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &udf);
     }
+    if win_needs_win7_ulw() {
+        // Dark surface matching `#context-menu` / `#update-toast` so rounded overlays blend cleanly.
+        if std::env::var_os("WEBVIEW2_DEFAULT_BACKGROUND_COLOR").is_none() {
+            std::env::set_var("WEBVIEW2_DEFAULT_BACKGROUND_COLOR", "FF18191E");
+        }
+        // Keep offscreen-parked WebView2 rendering smoothly at 30-60 FPS without Chromium occlusion throttling!
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        let mut merged = existing.trim().to_string();
+        for flag in [
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ] {
+            if !merged.contains(flag) {
+                if !merged.is_empty() {
+                    merged.push(' ');
+                }
+                merged.push_str(flag);
+            }
+        }
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_configure_display_env() {
+    // Prevent WebKitGTK 4.1 DMABUF blank/black transparent window issues on KylinOS/Mesa/NVIDIA/VMs
+    // while keeping RGBA compositing transparency intact.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    // Prefer X11/XWayland when DISPLAY is available so bottom-right window placement,
+    // XShape click-through, and zero-root XRecord global input work reliably across desktop environments.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        && std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+        && std::env::var_os("GDK_BACKEND").is_none()
+        && std::env::var_os("KUROCAT_WAYLAND").is_none()
+    {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1077,6 +1924,10 @@ pub fn run() {
     {
         win_wait_for_previous_pid_if_requested();
         win_configure_local_webview2_runtime();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_configure_display_env();
     }
 
     let mut initial_settings = load_settings();
@@ -1087,6 +1938,8 @@ pub fn run() {
     }
     let settings_arc = Arc::new(Mutex::new(initial_settings.clone()));
     let menu_open = Arc::new(AtomicBool::new(false));
+    let menu_creating = Arc::new(AtomicBool::new(false));
+    let menu_opened_at = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10)));
     let dragging = Arc::new(AtomicBool::new(false));
     let mcp_enabled = Arc::new(AtomicBool::new(initial_settings.mcp_enabled));
     let update_banner_open = Arc::new(AtomicBool::new(false));
@@ -1103,6 +1956,8 @@ pub fn run() {
         .manage(AppState {
             settings: settings_arc,
             menu_open,
+            menu_creating,
+            menu_opened_at,
             dragging,
             mcp_enabled,
             update_banner_open,
@@ -1118,21 +1973,82 @@ pub fn run() {
             }
 
             if let Some(win) = app.get_webview_window("main") {
-                let _ = win.set_always_on_top(s.always_on_top);
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = win.set_visible_on_all_workspaces(true);
-                    configure_macos_fullscreen_overlay(&win, s.always_on_top);
-                }
                 let (win_w, win_h) = window_dimensions(&s.keyboard_layout, s.scale);
                 let _ = win.set_size(Size::Logical(LogicalSize::new(win_w, win_h)));
-                if let (Some(x), Some(y)) = (s.x, s.y) {
-                    let _ = win.set_position(PhysicalPosition::new(x, y));
-                } else {
+                #[cfg(not(target_os = "macos"))]
+                let (target_x, target_y, sz) = {
                     let sz = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
                     let sf = win.scale_factor().unwrap_or(1.0);
-                    let (dx, dy) = default_bottom_right_position(sz.width as i32, sz.height as i32, sf);
-                    let _ = win.set_position(PhysicalPosition::new(dx, dy));
+                    let (x, y) = if let (Some(x), Some(y)) = (s.x, s.y) {
+                        (x, y)
+                    } else {
+                        default_bottom_right_position(sz.width as i32, sz.height as i32, sf)
+                    };
+                    (x, y, sz)
+                };
+                #[cfg(all(not(windows), not(target_os = "macos")))]
+                let _ = sz;
+
+                #[cfg(windows)]
+                let (target_x, target_y, sz, anchored) = {
+                    match windows_display::initial_placement(&win, &s) {
+                        Some(target) => (target.position.x, target.position.y, target.size, true),
+                        None => (target_x, target_y, sz, false),
+                    }
+                };
+
+                #[cfg(windows)]
+                if win_needs_win7_ulw() {
+                    // On Windows 7/8: spawn our dedicated Win32 UpdateLayeredWindow (ULW_ALPHA)
+                    // 256-level anti-aliased presenter window at (target_x, target_y), and park the
+                    // WebView2 offscreen renderer at (-16000, -16000) so there is ZERO white box!
+                    win_force_click_through(&win, false);
+                    let _ = win.set_always_on_top(s.always_on_top);
+                    let _ = win.set_position(PhysicalPosition::new(
+                        WIN7_OFFSCREEN_PARK_POS,
+                        WIN7_OFFSCREEN_PARK_POS,
+                    ));
+                    if anchored {
+                        let _ = win.set_size(sz);
+                    }
+                    win7_layered::init(
+                        handle.clone(),
+                        target_x,
+                        target_y,
+                        sz.width,
+                        sz.height,
+                        s.always_on_top,
+                    );
+                } else {
+                    let _ = win.set_always_on_top(s.always_on_top);
+                    let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+                    if anchored {
+                        let _ = win.set_size(sz);
+                    }
+                }
+
+                #[cfg(all(not(windows), not(target_os = "macos")))]
+                {
+                    let _ = win.set_always_on_top(s.always_on_top);
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = win.set_visible_on_all_workspaces(true);
+                        let _ = win.set_skip_taskbar(true);
+                    }
+                    let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    macos_window::configure_fullscreen(&win, s.always_on_top);
+                    match (s.display_id.as_deref(), s.x, s.y) {
+                        (None, Some(x), Some(y)) => {
+                            let _ = win.set_position(PhysicalPosition::new(x, y));
+                        }
+                        (preferred, _, _) => {
+                            macos_window::place(&win, preferred);
+                        }
+                    }
                 }
             }
 
@@ -1157,10 +2073,26 @@ pub fn run() {
             }
 
             let http_handle = handle.clone();
-            let mcp_port = if s.mcp_port == 0 { 27420 } else { s.mcp_port };
+            let mcp_port = if s.mcp_port == 0 { config::default_mcp_port() } else { s.mcp_port };
             mcp::start_http_mcp_server(mcp_port, mcp_for_setup, move || {
                 reload_and_emit_all(&http_handle);
             });
+
+            // Forward settings / cats / privacy broadcasts to OBS SSE clients (1ns no-op when OBS is off)
+            handle.listen("kuro-settings", |ev| {
+                obs::broadcast_raw("settings", ev.payload());
+            });
+            handle.listen("kuro-cats", |ev| {
+                obs::broadcast_raw("cats", ev.payload());
+            });
+            handle.listen("kuro-privacy", |ev| {
+                let active = ev.payload().trim() == "true";
+                obs::set_privacy_active(active);
+            });
+            obs::sync_obs_server(&handle, s.obs_enabled, s.obs_port);
+            if s.obs_enabled && s.obs_hide_pet {
+                set_pet_visible(&handle, false);
+            }
 
             if std::env::args().any(|a| a == "--demo") {
                 let demo_handle = handle.clone();
@@ -1199,11 +2131,19 @@ pub fn run() {
             get_settings,
             get_cats,
             get_mcp_config,
+            get_obs_url,
             get_app_version,
             update_settings,
+            open_context_menu,
+            close_context_menu,
+            open_tail_picker_from_menu,
+            preview_scale,
             set_menu_open,
             set_dragging,
             set_update_banner_open,
+            is_win7_ulw_mode,
+            win7_present_frame,
+            win7_sync_overlay,
             save_window_pos,
             reset_position,
             create_desktop_shortcut,
@@ -1307,5 +2247,60 @@ mod windows_zorder_tests {
 
         // Verify elevation query runs safely without panicking
         let _ = win_is_elevated();
+    }
+
+    #[test]
+    fn win7_rounded_overlay_region_clips_menu_and_toast_cleanly() {
+        use windows_sys::Win32::Graphics::Gdi::{DeleteObject, PtInRegion};
+        // Context menu card (radius 12) + update toast pill (radius 20)
+        let rects = vec![
+            10, 10, 224, 310, 12,
+            60, 8, 340, 42, 20,
+        ];
+        unsafe {
+            let rgn = build_rounded_overlay_hrgn(&rects);
+            assert!(!rgn.is_null(), "CreateRoundRectRgn + CombineRgn should produce valid HRGN");
+            assert_ne!(PtInRegion(rgn, 100, 150), 0, "inside context menu");
+            assert_ne!(PtInRegion(rgn, 200, 24), 0, "inside update toast");
+            assert_eq!(PtInRegion(rgn, 10, 10), 0, "sharp 12px corner tip should be rounded off");
+        assert_eq!(PtInRegion(rgn, 350, 200), 0, "empty area outside overlays must be clipped away");
+        DeleteObject(rgn as _);
+    }
+}
+}
+
+#[cfg(test)]
+mod side_menu_layout_tests {
+    use super::compute_side_menu_pos;
+
+    #[test]
+    fn places_menu_to_left_of_bottom_right_cat_with_zero_overlap() {
+        // 1920x1040 monitor, cat at bottom-right (1580, 620, 315, 410)
+        let pet = (1580, 620, 315, 410);
+        let work = (0, 0, 1920, 1040);
+        let menu = (266, 620);
+        let (mx, my) = compute_side_menu_pos(pet, work, menu, 10, 10);
+        assert_eq!(mx, 1580 - 266 - 10, "should open cleanly to the left of the cat");
+        assert!(mx + menu.0 <= pet.0, "menu must NOT overlap the cat horizontally");
+        assert_eq!(my, 620 + 410 - 620, "should align cleanly to cat bottom edge");
+    }
+
+    #[test]
+    fn flips_menu_to_right_when_cat_sits_near_left_edge() {
+        let pet = (16, 620, 315, 410);
+        let work = (0, 0, 1920, 1040);
+        let menu = (266, 620);
+        let (mx, _my) = compute_side_menu_pos(pet, work, menu, 10, 10);
+        assert_eq!(mx, 16 + 315 + 10, "should flip cleanly to the right of the cat");
+        assert!(mx >= pet.0 + pet.2, "menu must NOT overlap the cat horizontally");
+    }
+
+    #[test]
+    fn places_menu_above_cat_when_horizontal_space_is_tight() {
+        let pet = (100, 560, 300, 300);
+        let work = (0, 0, 520, 900);
+        let menu = (266, 400);
+        let (_mx, my) = compute_side_menu_pos(pet, work, menu, 10, 10);
+        assert!(my + menu.1 <= pet.1, "should open cleanly above the cat");
     }
 }

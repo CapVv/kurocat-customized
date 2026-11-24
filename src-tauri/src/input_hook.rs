@@ -1,5 +1,7 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -87,6 +89,12 @@ pub fn is_alt_pressed() -> bool {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
         let async_down = unsafe { (GetAsyncKeyState(VK_MENU as i32) as u16 & 0x8000) != 0 };
         if async_down {
+            return true;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if linux_hook::is_alt_pressed() {
             return true;
         }
     }
@@ -237,81 +245,314 @@ pub fn hid_usage_to_vk(usage: u32) -> Option<u32> {
     Some(vk)
 }
 
+/// Maps Linux evdev keycodes (`<linux/input-event-codes.h>`, also X11 evdev keycode - 8)
+/// to Windows VK codes used by the KuroCat frontend keyboard layout.
+#[allow(dead_code)]
+pub fn linux_evdev_to_vk(code: u16) -> Option<u32> {
+    let vk = match code {
+        1 => 0x1B,   // KEY_ESC
+        2..=10 => 0x31 + (code as u32 - 2), // KEY_1..KEY_9
+        11 => 0x30,  // KEY_0
+        12 => 0xBD,  // KEY_MINUS
+        13 => 0xBB,  // KEY_EQUAL
+        14 => 0x08,  // KEY_BACKSPACE
+        15 => 0x09,  // KEY_TAB
+        16 => 0x51,  // Q
+        17 => 0x57,  // W
+        18 => 0x45,  // E
+        19 => 0x52,  // R
+        20 => 0x54,  // T
+        21 => 0x59,  // Y
+        22 => 0x55,  // U
+        23 => 0x49,  // I
+        24 => 0x4F,  // O
+        25 => 0x50,  // P
+        26 => 0xDB,  // KEY_LEFTBRACE [
+        27 => 0xDD,  // KEY_RIGHTBRACE ]
+        28 => 0x0D,  // KEY_ENTER
+        29 => 0xA2,  // KEY_LEFTCTRL
+        30 => 0x41,  // A
+        31 => 0x53,  // S
+        32 => 0x44,  // D
+        33 => 0x46,  // F
+        34 => 0x47,  // G
+        35 => 0x48,  // H
+        36 => 0x4A,  // J
+        37 => 0x4B,  // K
+        38 => 0x4C,  // L
+        39 => 0xBA,  // KEY_SEMICOLON ;
+        40 => 0xDE,  // KEY_APOSTROPHE '
+        41 => 0xC0,  // KEY_GRAVE `
+        42 => 0xA0,  // KEY_LEFTSHIFT
+        43 => 0xDC,  // KEY_BACKSLASH \
+        44 => 0x5A,  // Z
+        45 => 0x58,  // X
+        46 => 0x43,  // C
+        47 => 0x56,  // V
+        48 => 0x42,  // B
+        49 => 0x4E,  // N
+        50 => 0x4D,  // M
+        51 => 0xBC,  // KEY_COMMA ,
+        52 => 0xBE,  // KEY_DOT .
+        53 => 0xBF,  // KEY_SLASH /
+        54 => 0xA1,  // KEY_RIGHTSHIFT
+        55 => 0x6A,  // KEY_KPASTERISK
+        56 => 0xA4,  // KEY_LEFTALT
+        57 => 0x20,  // KEY_SPACE
+        58 => 0x14,  // KEY_CAPSLOCK
+        59..=68 => 0x70 + (code as u32 - 59), // KEY_F1..KEY_F10
+        69 => 0x90,  // KEY_NUMLOCK
+        70 => 0x91,  // KEY_SCROLLLOCK
+        71 => 0x67,  // KEY_KP7
+        72 => 0x68,  // KEY_KP8
+        73 => 0x69,  // KEY_KP9
+        74 => 0x6D,  // KEY_KPMINUS
+        75 => 0x64,  // KEY_KP4
+        76 => 0x65,  // KEY_KP5
+        77 => 0x66,  // KEY_KP6
+        78 => 0x6B,  // KEY_KPPLUS
+        79 => 0x61,  // KEY_KP1
+        80 => 0x62,  // KEY_KP2
+        81 => 0x63,  // KEY_KP3
+        82 => 0x60,  // KEY_KP0
+        83 => 0x6E,  // KEY_KPDOT
+        87 => 0x7A,  // KEY_F11
+        88 => 0x7B,  // KEY_F12
+        96 => 0x10D, // KEY_KPENTER (distinguished Numpad Enter)
+        97 => 0xA3,  // KEY_RIGHTCTRL
+        98 => 0x6F,  // KEY_KPSLASH
+        99 => 0x2C,  // KEY_SYSRQ (PrintScreen)
+        100 => 0xA5, // KEY_RIGHTALT
+        102 => 0x24, // KEY_HOME
+        103 => 0x26, // KEY_UP
+        104 => 0x21, // KEY_PAGEUP
+        105 => 0x25, // KEY_LEFT
+        106 => 0x27, // KEY_RIGHT
+        107 => 0x23, // KEY_END
+        108 => 0x28, // KEY_DOWN
+        109 => 0x22, // KEY_PAGEDOWN
+        110 => 0x2D, // KEY_INSERT
+        111 => 0x2E, // KEY_DELETE
+        119 => 0x13, // KEY_PAUSE
+        125 => 0x5B, // KEY_LEFTMETA (Super/Win)
+        126 => 0x5C, // KEY_RIGHTMETA
+        127 => 0x5D, // KEY_COMPOSE (Menu)
+        _ => return None,
+    };
+    Some(vk)
+}
+
 pub fn start_global_hooks(app: AppHandle) {
     let (tx, rx) = mpsc::channel::<RawHookMsg>();
     let _ = HOOK_TX.set(tx);
 
     // Dispatcher thread: deduplicates held key repeats & dual-channel macOS events,
-    // and throttles mouse moves to ~60Hz
+    // throttles mouse moves to ~60Hz, and reconciles lost KeyUp/MouseUp events (Fixes #3 & #4).
     std::thread::spawn(move || {
         let mut dedup = KeyDeduplicator::new();
         let mut last_mouse_emit = Instant::now() - Duration::from_secs(1);
+        let mut mouse_down = [false; 3]; // 0: left, 1: right, 2: middle
+        let mut last_reconcile = Instant::now();
 
-        while let Ok(msg) = rx.recv() {
+        let btn_index = |btn: &str| -> Option<usize> {
+            match btn {
+                "left" => Some(0),
+                "right" => Some(1),
+                "middle" => Some(2),
+                _ => None,
+            }
+        };
+
+        let emit_input = |app: &AppHandle, ev: InputEvent| {
+            crate::obs::broadcast_input(&ev);
+            let _ = app.emit("kuro-input", ev);
+        };
+
+        let release_all_held =
+            |app: &AppHandle, dedup: &mut KeyDeduplicator, mouse_down: &mut [bool; 3]| {
+                for (i, name) in [(0usize, "left"), (1, "right"), (2, "middle")] {
+                    if mouse_down[i] {
+                        mouse_down[i] = false;
+                        emit_input(
+                            app,
+                            InputEvent::MouseUp {
+                                button: name.to_string(),
+                            },
+                        );
+                    }
+                }
+                for vk in 0..dedup.logical_pressed.len() {
+                    if dedup.logical_pressed[vk] {
+                        dedup.logical_pressed[vk] = false;
+                        emit_input(
+                            app,
+                            InputEvent::KeyUp {
+                                vk: vk as u32,
+                                scan: 0,
+                            },
+                        );
+                    }
+                }
+            };
+
+        #[cfg(windows)]
+        let reconcile_windows_held_state =
+            |app: &AppHandle, dedup: &mut KeyDeduplicator, mouse_down: &mut [bool; 3]| {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+                    GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+                };
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetSystemMetrics, SM_SWAPBUTTON,
+                };
+
+                let swapped = unsafe { GetSystemMetrics(SM_SWAPBUTTON) != 0 };
+                let (left_vk, right_vk) = if swapped {
+                    (VK_RBUTTON as i32, VK_LBUTTON as i32)
+                } else {
+                    (VK_LBUTTON as i32, VK_RBUTTON as i32)
+                };
+                let checks = [
+                    (0usize, left_vk, "left"),
+                    (1usize, right_vk, "right"),
+                    (2usize, VK_MBUTTON as i32, "middle"),
+                ];
+                for (idx, os_vk, name) in checks {
+                    if mouse_down[idx] {
+                        let physically_down =
+                            unsafe { (GetAsyncKeyState(os_vk) as u16 & 0x8000) != 0 };
+                        if !physically_down {
+                            mouse_down[idx] = false;
+                            emit_input(
+                                app,
+                                InputEvent::MouseUp {
+                                    button: name.to_string(),
+                                },
+                            );
+                        }
+                    }
+                }
+
+                for vk in 1..dedup.logical_pressed.len() {
+                    if !dedup.logical_pressed[vk] {
+                        continue;
+                    }
+                    let os_vk = if vk == 0x10D {
+                        0x0D // Numpad Enter maps to VK_RETURN in GetAsyncKeyState
+                    } else if vk < 256 {
+                        vk as i32
+                    } else {
+                        continue;
+                    };
+                    let physically_down =
+                        unsafe { (GetAsyncKeyState(os_vk) as u16 & 0x8000) != 0 };
+                    if !physically_down {
+                        dedup.logical_pressed[vk] = false;
+                        if is_alt_vk(vk as u32) {
+                            ALT_HELD.store(false, Ordering::Relaxed);
+                        }
+                        emit_input(
+                            app,
+                            InputEvent::KeyUp {
+                                vk: vk as u32,
+                                scan: 0,
+                            },
+                        );
+                    }
+                }
+            };
+
+        loop {
+            let msg = match rx.recv_timeout(Duration::from_millis(450)) {
+                Ok(m) => Some(m),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
             if HOOKS_PAUSED.load(Ordering::Relaxed) {
+                release_all_held(&app, &mut dedup, &mut mouse_down);
                 continue;
             }
-            match msg {
-                RawHookMsg::KeyDown { vk, scan, source } => {
-                    if is_alt_vk(vk) {
-                        ALT_HELD.store(true, Ordering::Relaxed);
-                    }
-                    if PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
-                        // Zero password keystrokes leave Rust — only emit a content-less privacy pulse!
+
+            if let Some(msg) = msg {
+                match msg {
+                    RawHookMsg::KeyDown { vk, scan, source } => {
+                        if is_alt_vk(vk) {
+                            ALT_HELD.store(true, Ordering::Relaxed);
+                        }
+                        if PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
+                            // Zero password keystrokes leave Rust — only emit a content-less privacy pulse!
+                            if let Some(repeat) = dedup.on_key_down(vk, source, Instant::now()) {
+                                if !repeat {
+                                    emit_input(&app, InputEvent::PrivacyTyping);
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(repeat) = dedup.on_key_down(vk, source, Instant::now()) {
                             if !repeat {
-                                let _ = app.emit("kuro-input", InputEvent::PrivacyTyping);
+                                KEY_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
                             }
+                            emit_input(&app, InputEvent::KeyDown { vk, scan, repeat });
                         }
-                        continue;
                     }
-                    if let Some(repeat) = dedup.on_key_down(vk, source, Instant::now()) {
-                        if !repeat {
-                            KEY_EVENTS_RECEIVED.fetch_add(1, Ordering::Relaxed);
+                    RawHookMsg::KeyUp { vk, scan, source } => {
+                        if is_alt_vk(vk) {
+                            ALT_HELD.store(false, Ordering::Relaxed);
                         }
-                        let _ = app.emit("kuro-input", InputEvent::KeyDown { vk, scan, repeat });
+                        if PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
+                            let _ = dedup.on_key_up(vk, source);
+                            continue;
+                        }
+                        if dedup.on_key_up(vk, source) {
+                            emit_input(&app, InputEvent::KeyUp { vk, scan });
+                        }
                     }
-                }
-                RawHookMsg::KeyUp { vk, scan, source } => {
-                    if is_alt_vk(vk) {
-                        ALT_HELD.store(false, Ordering::Relaxed);
+                    RawHookMsg::MouseDown(btn) => {
+                        if let Some(i) = btn_index(btn) {
+                            mouse_down[i] = true;
+                        }
+                        emit_input(
+                            &app,
+                            InputEvent::MouseDown {
+                                button: btn.to_string(),
+                            },
+                        );
                     }
-                    if PASSWORD_PRIVACY_ACTIVE.load(Ordering::Relaxed) {
-                        let _ = dedup.on_key_up(vk, source);
-                        continue;
+                    RawHookMsg::MouseUp(btn) => {
+                        if let Some(i) = btn_index(btn) {
+                            mouse_down[i] = false;
+                        }
+                        emit_input(
+                            &app,
+                            InputEvent::MouseUp {
+                                button: btn.to_string(),
+                            },
+                        );
                     }
-                    if dedup.on_key_up(vk, source) {
-                        let _ = app.emit("kuro-input", InputEvent::KeyUp { vk, scan });
+                    RawHookMsg::MouseWheel(delta) => {
+                        emit_input(&app, InputEvent::MouseWheel { delta });
                     }
-                }
-                RawHookMsg::MouseDown(btn) => {
-                    let _ = app.emit(
-                        "kuro-input",
-                        InputEvent::MouseDown {
-                            button: btn.to_string(),
-                        },
-                    );
-                }
-                RawHookMsg::MouseUp(btn) => {
-                    let _ = app.emit(
-                        "kuro-input",
-                        InputEvent::MouseUp {
-                            button: btn.to_string(),
-                        },
-                    );
-                }
-                RawHookMsg::MouseWheel(delta) => {
-                    let _ = app.emit("kuro-input", InputEvent::MouseWheel { delta });
-                }
-                RawHookMsg::MouseMove { x, y } => {
-                    let now = Instant::now();
-                    if now.duration_since(last_mouse_emit) >= Duration::from_millis(16) {
-                        last_mouse_emit = now;
-                        let (nx, ny) = normalize_screen_point(x, y);
-                        let _ = app.emit("kuro-input", InputEvent::MouseMove { x, y, nx, ny });
+                    RawHookMsg::MouseMove { x, y } => {
+                        let now = Instant::now();
+                        if now.duration_since(last_mouse_emit) >= Duration::from_millis(16) {
+                            last_mouse_emit = now;
+                            let (nx, ny) = normalize_screen_point(x, y);
+                            emit_input(&app, InputEvent::MouseMove { x, y, nx, ny });
+                        }
                     }
                 }
             }
+
+            #[cfg(windows)]
+            {
+                let now = Instant::now();
+                if now.duration_since(last_reconcile) >= Duration::from_millis(450) {
+                    last_reconcile = now;
+                    reconcile_windows_held_state(&app, &mut dedup, &mut mouse_down);
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = &mut last_reconcile;
         }
     });
 
@@ -323,6 +564,11 @@ pub fn start_global_hooks(app: AppHandle) {
     #[cfg(target_os = "macos")]
     std::thread::spawn(|| {
         macos_hook::run_macos_hook_loop();
+    });
+
+    #[cfg(target_os = "linux")]
+    std::thread::spawn(|| {
+        linux_hook::run_linux_hook_loop();
     });
 }
 
@@ -351,7 +597,15 @@ fn normalize_screen_point(x: i32, y: i32) -> (f64, f64) {
     (nx, ny)
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
+fn normalize_screen_point(x: i32, y: i32) -> (f64, f64) {
+    let (w, h) = linux_hook::primary_screen_size();
+    let nx = (x as f64 / (w.max(1) as f64)).clamp(0.0, 1.0);
+    let ny = (y as f64 / (h.max(1) as f64)).clamp(0.0, 1.0);
+    (nx, ny)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn normalize_screen_point(_x: i32, _y: i32) -> (f64, f64) {
     (0.5, 0.5)
 }
@@ -1437,9 +1691,650 @@ pub mod macos_hook {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub mod linux_hook {
+    use super::{linux_evdev_to_vk, KeySource, RawHookMsg, HOOK_TX};
+    use std::cell::RefCell;
+    use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const RTLD_LAZY: c_int = 0x00001;
+    const RTLD_LOCAL: c_int = 0x00000;
+    const X_RECORD_ALL_CLIENTS: c_ulong = 3;
+    const X_RECORD_FROM_SERVER: c_int = 0;
+    const MOD1_MASK: c_uint = 1 << 3; // Alt key in X11 modifier mask
+
+    #[link(name = "dl")]
+    extern "C" {
+        fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    #[repr(C)]
+    struct XRecordRange8 {
+        first: u8,
+        last: u8,
+    }
+
+    #[repr(C)]
+    struct XRecordRange16 {
+        first: u16,
+        last: u16,
+    }
+
+    #[repr(C)]
+    struct XRecordExtRange {
+        ext_major: XRecordRange8,
+        ext_minor: XRecordRange16,
+    }
+
+    #[repr(C)]
+    struct XRecordRange {
+        core_requests: XRecordRange8,
+        core_replies: XRecordRange8,
+        ext_requests: XRecordExtRange,
+        ext_replies: XRecordExtRange,
+        delivered_events: XRecordRange8,
+        device_events: XRecordRange8,
+        errors: XRecordRange8,
+        client_started: c_int,
+        client_died: c_int,
+    }
+
+    #[repr(C)]
+    struct XRecordInterceptData {
+        id_base: c_ulong,
+        server_time: c_ulong,
+        client_seq: c_ulong,
+        category: c_int,
+        client_swapped: c_int,
+        data: *const u8,
+        data_len: c_ulong,
+    }
+
+    type XOpenDisplayFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type XCloseDisplayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type XDefaultScreenFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type XDefaultRootWindowFn = unsafe extern "C" fn(*mut c_void) -> c_ulong;
+    type XDisplayWidthFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+    type XDisplayHeightFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+    type XSyncFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+    type XFreeFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type XQueryPointerFn = unsafe extern "C" fn(
+        *mut c_void,
+        c_ulong,
+        *mut c_ulong,
+        *mut c_ulong,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_int,
+        *mut c_uint,
+    ) -> c_int;
+
+    type XRecordQueryVersionFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
+    type XRecordAllocRangeFn = unsafe extern "C" fn() -> *mut XRecordRange;
+    type XRecordCreateContextFn = unsafe extern "C" fn(
+        *mut c_void,
+        c_int,
+        *mut c_ulong,
+        c_int,
+        *mut *mut XRecordRange,
+        c_int,
+    ) -> c_ulong;
+    type XRecordInterceptProc =
+        unsafe extern "C" fn(*mut c_void, *mut XRecordInterceptData);
+    type XRecordEnableContextFn = unsafe extern "C" fn(
+        *mut c_void,
+        c_ulong,
+        XRecordInterceptProc,
+        *mut c_void,
+    ) -> c_int;
+    type XRecordFreeContextFn = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int;
+    type XRecordFreeDataFn = unsafe extern "C" fn(*mut XRecordInterceptData);
+
+    struct X11Api {
+        open_display: XOpenDisplayFn,
+        close_display: XCloseDisplayFn,
+        default_screen: XDefaultScreenFn,
+        default_root_window: XDefaultRootWindowFn,
+        display_width: XDisplayWidthFn,
+        display_height: XDisplayHeightFn,
+        sync: XSyncFn,
+        xfree: XFreeFn,
+        query_pointer: XQueryPointerFn,
+    }
+
+    struct XRecordApi {
+        query_version: XRecordQueryVersionFn,
+        alloc_range: XRecordAllocRangeFn,
+        create_context: XRecordCreateContextFn,
+        enable_context: XRecordEnableContextFn,
+        free_context: XRecordFreeContextFn,
+        free_data: XRecordFreeDataFn,
+    }
+
+    static X11_API: OnceLock<Option<X11Api>> = OnceLock::new();
+    static XRECORD_API: OnceLock<Option<XRecordApi>> = OnceLock::new();
+    static XRECORD_FREE_DATA: OnceLock<XRecordFreeDataFn> = OnceLock::new();
+
+    static SCREEN_W: AtomicI32 = AtomicI32::new(0);
+    static SCREEN_H: AtomicI32 = AtomicI32::new(0);
+    static LAST_CURSOR_X: AtomicI32 = AtomicI32::new(0);
+    static LAST_CURSOR_Y: AtomicI32 = AtomicI32::new(0);
+    static HAS_CURSOR: AtomicBool = AtomicBool::new(false);
+    static X11_ALT_HELD: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn load_sym<T>(lib: *mut c_void, name: &'static [u8]) -> Option<T> {
+        let ptr = dlsym(lib, name.as_ptr() as *const c_char);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&ptr))
+        }
+    }
+
+    fn x11_api() -> Option<&'static X11Api> {
+        X11_API
+            .get_or_init(|| unsafe {
+                let lib = dlopen(b"libX11.so.6\0".as_ptr() as *const c_char, RTLD_LAZY | RTLD_LOCAL);
+                if lib.is_null() {
+                    return None;
+                }
+                Some(X11Api {
+                    open_display: load_sym(lib, b"XOpenDisplay\0")?,
+                    close_display: load_sym(lib, b"XCloseDisplay\0")?,
+                    default_screen: load_sym(lib, b"XDefaultScreen\0")?,
+                    default_root_window: load_sym(lib, b"XDefaultRootWindow\0")?,
+                    display_width: load_sym(lib, b"XDisplayWidth\0")?,
+                    display_height: load_sym(lib, b"XDisplayHeight\0")?,
+                    sync: load_sym(lib, b"XSync\0")?,
+                    xfree: load_sym(lib, b"XFree\0")?,
+                    query_pointer: load_sym(lib, b"XQueryPointer\0")?,
+                })
+            })
+            .as_ref()
+    }
+
+    fn xrecord_api() -> Option<&'static XRecordApi> {
+        XRECORD_API
+            .get_or_init(|| unsafe {
+                let lib = dlopen(b"libXtst.so.6\0".as_ptr() as *const c_char, RTLD_LAZY | RTLD_LOCAL);
+                if lib.is_null() {
+                    return None;
+                }
+                Some(XRecordApi {
+                    query_version: load_sym(lib, b"XRecordQueryVersion\0")?,
+                    alloc_range: load_sym(lib, b"XRecordAllocRange\0")?,
+                    create_context: load_sym(lib, b"XRecordCreateContext\0")?,
+                    enable_context: load_sym(lib, b"XRecordEnableContext\0")?,
+                    free_context: load_sym(lib, b"XRecordFreeContext\0")?,
+                    free_data: load_sym(lib, b"XRecordFreeData\0")?,
+                })
+            })
+            .as_ref()
+    }
+
+    fn update_screen_size_from_display(api: &X11Api, dpy: *mut c_void) -> (i32, i32) {
+        unsafe {
+            let scr = (api.default_screen)(dpy);
+            let w = (api.display_width)(dpy, scr);
+            let h = (api.display_height)(dpy, scr);
+            if w > 0 && h > 0 {
+                SCREEN_W.store(w, Ordering::Relaxed);
+                SCREEN_H.store(h, Ordering::Relaxed);
+                (w, h)
+            } else {
+                (1920, 1080)
+            }
+        }
+    }
+
+    pub fn primary_screen_size() -> (i32, i32) {
+        let cw = SCREEN_W.load(Ordering::Relaxed);
+        let ch = SCREEN_H.load(Ordering::Relaxed);
+        if cw > 0 && ch > 0 {
+            return (cw, ch);
+        }
+        if let Some(api) = x11_api() {
+            unsafe {
+                let dpy = (api.open_display)(std::ptr::null());
+                if !dpy.is_null() {
+                    let size = update_screen_size_from_display(api, dpy);
+                    (api.close_display)(dpy);
+                    return size;
+                }
+            }
+        }
+        (1920, 1080)
+    }
+
+    struct X11QueryConn {
+        dpy: *mut c_void,
+        root: c_ulong,
+        close_fn: XCloseDisplayFn,
+    }
+
+    impl Drop for X11QueryConn {
+        fn drop(&mut self) {
+            if !self.dpy.is_null() {
+                unsafe {
+                    (self.close_fn)(self.dpy);
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static QUERY_CONN: RefCell<Option<Option<X11QueryConn>>> = const { RefCell::new(None) };
+    }
+
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        if let Some(api) = x11_api() {
+            let queried = QUERY_CONN.with(|cell| {
+                let mut borrow = cell.borrow_mut();
+                if borrow.is_none() {
+                    let conn = unsafe {
+                        let dpy = (api.open_display)(std::ptr::null());
+                        if dpy.is_null() {
+                            None
+                        } else {
+                            let root = (api.default_root_window)(dpy);
+                            update_screen_size_from_display(api, dpy);
+                            Some(X11QueryConn {
+                                dpy,
+                                root,
+                                close_fn: api.close_display,
+                            })
+                        }
+                    };
+                    *borrow = Some(conn);
+                }
+                if let Some(Some(conn)) = borrow.as_ref() {
+                    let mut root_ret: c_ulong = 0;
+                    let mut child_ret: c_ulong = 0;
+                    let mut root_x: c_int = 0;
+                    let mut root_y: c_int = 0;
+                    let mut win_x: c_int = 0;
+                    let mut win_y: c_int = 0;
+                    let mut mask: c_uint = 0;
+                    let ok = unsafe {
+                        (api.query_pointer)(
+                            conn.dpy,
+                            conn.root,
+                            &mut root_ret,
+                            &mut child_ret,
+                            &mut root_x,
+                            &mut root_y,
+                            &mut win_x,
+                            &mut win_y,
+                            &mut mask,
+                        )
+                    };
+                    if ok != 0 {
+                        X11_ALT_HELD.store((mask & MOD1_MASK) != 0, Ordering::Relaxed);
+                        LAST_CURSOR_X.store(root_x, Ordering::Relaxed);
+                        LAST_CURSOR_Y.store(root_y, Ordering::Relaxed);
+                        HAS_CURSOR.store(true, Ordering::Relaxed);
+                        return Some((root_x, root_y));
+                    }
+                }
+                None
+            });
+            if queried.is_some() {
+                return queried;
+            }
+        }
+        if HAS_CURSOR.load(Ordering::Relaxed) {
+            Some((
+                LAST_CURSOR_X.load(Ordering::Relaxed),
+                LAST_CURSOR_Y.load(Ordering::Relaxed),
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn is_alt_pressed() -> bool {
+        X11_ALT_HELD.load(Ordering::Relaxed)
+    }
+
+    unsafe extern "C" fn record_callback(
+        _closure: *mut c_void,
+        intercept: *mut XRecordInterceptData,
+    ) {
+        if intercept.is_null() {
+            return;
+        }
+        let data_ref = &*intercept;
+        if data_ref.category == X_RECORD_FROM_SERVER
+            && !data_ref.data.is_null()
+            && data_ref.data_len >= 8
+        {
+            let byte_len = (data_ref.data_len as usize).saturating_mul(4);
+            let full = std::slice::from_raw_parts(data_ref.data, byte_len);
+            let swapped = data_ref.client_swapped != 0;
+
+            if let Some(tx) = HOOK_TX.get() {
+                let mut off = 0usize;
+                while off + 32 <= full.len() {
+                    let raw = &full[off..off + 32];
+                    off += 32;
+                    let ev_type = raw[0] & 0x7F;
+                    let detail = raw[1];
+                    match ev_type {
+                        2 => {
+                            // X11 KeyPress (Xorg evdev keycodes are offset by +8)
+                            if detail >= 8 {
+                                if let Some(vk) = linux_evdev_to_vk((detail - 8) as u16) {
+                                    let _ = tx.send(RawHookMsg::KeyDown {
+                                        vk,
+                                        scan: detail as u32,
+                                        source: KeySource::Primary,
+                                    });
+                                }
+                            }
+                        }
+                        3 => {
+                            // X11 KeyRelease
+                            if detail >= 8 {
+                                if let Some(vk) = linux_evdev_to_vk((detail - 8) as u16) {
+                                    let _ = tx.send(RawHookMsg::KeyUp {
+                                        vk,
+                                        scan: detail as u32,
+                                        source: KeySource::Primary,
+                                    });
+                                }
+                            }
+                        }
+                        4 => {
+                            // X11 ButtonPress
+                            match detail {
+                                1 => {
+                                    let _ = tx.send(RawHookMsg::MouseDown("left"));
+                                }
+                                2 => {
+                                    let _ = tx.send(RawHookMsg::MouseDown("middle"));
+                                }
+                                3 => {
+                                    let _ = tx.send(RawHookMsg::MouseDown("right"));
+                                }
+                                4 => {
+                                    let _ = tx.send(RawHookMsg::MouseWheel(120));
+                                }
+                                5 => {
+                                    let _ = tx.send(RawHookMsg::MouseWheel(-120));
+                                }
+                                _ => {}
+                            }
+                        }
+                        5 => {
+                            // X11 ButtonRelease
+                            match detail {
+                                1 => {
+                                    let _ = tx.send(RawHookMsg::MouseUp("left"));
+                                }
+                                2 => {
+                                    let _ = tx.send(RawHookMsg::MouseUp("middle"));
+                                }
+                                3 => {
+                                    let _ = tx.send(RawHookMsg::MouseUp("right"));
+                                }
+                                _ => {}
+                            }
+                        }
+                        6 => {
+                            // X11 MotionNotify
+                            let mut rx = i16::from_ne_bytes([raw[20], raw[21]]);
+                            let mut ry = i16::from_ne_bytes([raw[22], raw[23]]);
+                            let mut state = u16::from_ne_bytes([raw[28], raw[29]]);
+                            if swapped {
+                                rx = rx.swap_bytes();
+                                ry = ry.swap_bytes();
+                                state = state.swap_bytes();
+                            }
+                            let x = rx as i32;
+                            let y = ry as i32;
+                            LAST_CURSOR_X.store(x, Ordering::Relaxed);
+                            LAST_CURSOR_Y.store(y, Ordering::Relaxed);
+                            HAS_CURSOR.store(true, Ordering::Relaxed);
+                            X11_ALT_HELD
+                                .store((state & (MOD1_MASK as u16)) != 0, Ordering::Relaxed);
+                            let _ = tx.send(RawHookMsg::MouseMove { x, y });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(free_fn) = XRECORD_FREE_DATA.get() {
+            free_fn(intercept);
+        }
+    }
+
+    fn try_run_xrecord_loop() -> bool {
+        let (Some(x11), Some(xrec)) = (x11_api(), xrecord_api()) else {
+            return false;
+        };
+        let _ = XRECORD_FREE_DATA.set(xrec.free_data);
+
+        unsafe {
+            let ctrl_dpy = (x11.open_display)(std::ptr::null());
+            if ctrl_dpy.is_null() {
+                return false;
+            }
+            let data_dpy = (x11.open_display)(std::ptr::null());
+            if data_dpy.is_null() {
+                (x11.close_display)(ctrl_dpy);
+                return false;
+            }
+
+            let mut major: c_int = 0;
+            let mut minor: c_int = 0;
+            if (xrec.query_version)(ctrl_dpy, &mut major, &mut minor) == 0 {
+                (x11.close_display)(data_dpy);
+                (x11.close_display)(ctrl_dpy);
+                return false;
+            }
+
+            update_screen_size_from_display(x11, ctrl_dpy);
+
+            let range = (xrec.alloc_range)();
+            if range.is_null() {
+                (x11.close_display)(data_dpy);
+                (x11.close_display)(ctrl_dpy);
+                return false;
+            }
+            // Capture KeyPress(2), KeyRelease(3), ButtonPress(4), ButtonRelease(5), MotionNotify(6)
+            (*range).device_events.first = 2;
+            (*range).device_events.last = 6;
+
+            let mut clients: c_ulong = X_RECORD_ALL_CLIENTS;
+            let mut range_ptr = range;
+            let ctx = (xrec.create_context)(ctrl_dpy, 0, &mut clients, 1, &mut range_ptr, 1);
+            (x11.xfree)(range as *mut c_void);
+
+            if ctx == 0 {
+                (x11.close_display)(data_dpy);
+                (x11.close_display)(ctrl_dpy);
+                return false;
+            }
+
+            // Flush context creation on control connection before enabling on data connection
+            (x11.sync)(ctrl_dpy, 0);
+
+            // Blocks until context is disabled or display disconnects
+            let ok = (xrec.enable_context)(data_dpy, ctx, record_callback, std::ptr::null_mut());
+
+            (xrec.free_context)(ctrl_dpy, ctx);
+            (x11.close_display)(data_dpy);
+            (x11.close_display)(ctrl_dpy);
+            ok != 0
+        }
+    }
+
+    /// Fallback capture for pure-Wayland sessions when the user belongs to the `input` group
+    /// (reads `/dev/input/event*` non-blockingly without requiring root).
+    fn run_evdev_fallback_loop() {
+        const O_NONBLOCK: c_int = 0x800; // Identical on Linux x86_64 and aarch64
+        const EV_KEY: u16 = 1;
+        const EV_REL: u16 = 2;
+        const REL_WHEEL: u16 = 8;
+        const BTN_LEFT: u16 = 272;
+        const BTN_RIGHT: u16 = 273;
+        const BTN_MIDDLE: u16 = 274;
+
+        let mut files: Vec<std::fs::File> = Vec::new();
+        let mut last_scan = Instant::now() - Duration::from_secs(10);
+        let mut buf = [0u8; 24 * 16];
+
+        loop {
+            if files.is_empty() || last_scan.elapsed() >= Duration::from_secs(10) {
+                last_scan = Instant::now();
+                let mut opened = Vec::new();
+                for i in 0..32 {
+                    let path = format!("/dev/input/event{}", i);
+                    if let Ok(f) = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(O_NONBLOCK)
+                        .open(&path)
+                    {
+                        opened.push(f);
+                    }
+                }
+                if !opened.is_empty() {
+                    files = opened;
+                }
+            }
+
+            if files.is_empty() {
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            let mut any_read = false;
+            for f in &mut files {
+                match f.read(&mut buf) {
+                    Ok(n) if n >= 24 => {
+                        any_read = true;
+                        let count = n / 24;
+                        if let Some(tx) = HOOK_TX.get() {
+                            for idx in 0..count {
+                                let off = idx * 24;
+                                // 64-bit Linux struct input_event: tv_sec(8), tv_usec(8), type(2), code(2), value(4)
+                                let ev_type = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]);
+                                let code = u16::from_ne_bytes([buf[off + 18], buf[off + 19]]);
+                                let val = i32::from_ne_bytes([
+                                    buf[off + 20],
+                                    buf[off + 21],
+                                    buf[off + 22],
+                                    buf[off + 23],
+                                ]);
+                                if ev_type == EV_KEY {
+                                    match code {
+                                        BTN_LEFT => {
+                                            if val == 1 {
+                                                let _ = tx.send(RawHookMsg::MouseDown("left"));
+                                            } else if val == 0 {
+                                                let _ = tx.send(RawHookMsg::MouseUp("left"));
+                                            }
+                                        }
+                                        BTN_RIGHT => {
+                                            if val == 1 {
+                                                let _ = tx.send(RawHookMsg::MouseDown("right"));
+                                            } else if val == 0 {
+                                                let _ = tx.send(RawHookMsg::MouseUp("right"));
+                                            }
+                                        }
+                                        BTN_MIDDLE => {
+                                            if val == 1 {
+                                                let _ = tx.send(RawHookMsg::MouseDown("middle"));
+                                            } else if val == 0 {
+                                                let _ = tx.send(RawHookMsg::MouseUp("middle"));
+                                            }
+                                        }
+                                        _ => {
+                                            if let Some(vk) = linux_evdev_to_vk(code) {
+                                                if val == 1 || val == 2 {
+                                                    let _ = tx.send(RawHookMsg::KeyDown {
+                                                        vk,
+                                                        scan: code as u32,
+                                                        source: KeySource::Primary,
+                                                    });
+                                                } else if val == 0 {
+                                                    let _ = tx.send(RawHookMsg::KeyUp {
+                                                        vk,
+                                                        scan: code as u32,
+                                                        source: KeySource::Primary,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if ev_type == EV_REL && code == REL_WHEEL && val != 0 {
+                                    let delta = if val > 0 { 120 } else { -120 };
+                                    let _ = tx.send(RawHookMsg::MouseWheel(delta));
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !any_read {
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        }
+    }
+
+    pub fn run_linux_hook_loop() {
+        // Primary: X11 XRecord (zero-root global keyboard + mouse + wheel + motion on Xorg/UKUI/XWayland)
+        let mut retries = 0u8;
+        while retries < 3 {
+            if try_run_xrecord_loop() {
+                // XRecord ran and exited cleanly (e.g. display reset); brief pause before re-attaching
+                std::thread::sleep(Duration::from_secs(1));
+                retries = 0;
+            } else {
+                retries = retries.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        // Fallback: non-blocking evdev capture (for pure Wayland users in the `input` group)
+        run_evdev_fallback_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_evdev_maps_letters_digits_modifiers_and_numpad() {
+        assert_eq!(linux_evdev_to_vk(1), Some(0x1B)); // Esc
+        assert_eq!(linux_evdev_to_vk(2), Some(0x31)); // 1
+        assert_eq!(linux_evdev_to_vk(11), Some(0x30)); // 0
+        assert_eq!(linux_evdev_to_vk(16), Some(0x51)); // Q
+        assert_eq!(linux_evdev_to_vk(30), Some(0x41)); // A
+        assert_eq!(linux_evdev_to_vk(44), Some(0x5A)); // Z
+        assert_eq!(linux_evdev_to_vk(28), Some(0x0D)); // Enter
+        assert_eq!(linux_evdev_to_vk(57), Some(0x20)); // Space
+        assert_eq!(linux_evdev_to_vk(96), Some(0x10D)); // Numpad Enter
+        assert_eq!(linux_evdev_to_vk(29), Some(0xA2)); // LCtrl
+        assert_eq!(linux_evdev_to_vk(56), Some(0xA4)); // LAlt
+        assert_eq!(linux_evdev_to_vk(100), Some(0xA5)); // RAlt
+        assert_eq!(linux_evdev_to_vk(125), Some(0x5B)); // Super/Meta
+        assert_eq!(linux_evdev_to_vk(87), Some(0x7A)); // F11
+        assert_eq!(linux_evdev_to_vk(88), Some(0x7B)); // F12
+        assert_eq!(linux_evdev_to_vk(0), None);
+    }
 
     #[test]
     fn hid_usage_maps_letters_digits_modifiers_and_numpad() {

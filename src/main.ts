@@ -2,10 +2,17 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { KuroCatEngine, type KeyboardOrientation, type PointerDevice } from './catEngine';
+import {
+  DEFAULT_TAIL_KEY_IDS,
+  KuroCatEngine,
+  TAIL_KEY_PRESETS,
+  type KeyboardOrientation,
+  type PointerDevice,
+  type TailKeyMode,
+} from './catEngine';
 import { catAudio } from './audio';
 import { DEFAULT_BUILTIN_CATS, type CatSkinConfig } from './catSkins';
-import type { KeyboardLayoutId } from './keyboardLayout';
+import { resolveKeyByVk, type KeyboardLayoutId } from './keyboardLayout';
 
 interface AppSettings {
   x: number | null;
@@ -23,6 +30,11 @@ interface AppSettings {
   keyboardOrientation: KeyboardOrientation;
   pointerDevice?: PointerDevice;
   privacyPasswordGuard: boolean;
+  tailKeyMode: TailKeyMode;
+  tailKeyIds: string[];
+  obsEnabled?: boolean;
+  obsPort?: number;
+  obsHidePet?: boolean;
 }
 
 type InputEvent =
@@ -61,7 +73,7 @@ interface UpdateProgressEvent {
   info: UpdateInfo | null;
 }
 
-let appVersion = '4.7.0';
+let appVersion = '4.9.1';
 let latestUpdateInfo: UpdateInfo | null = null;
 let updateBusy = false;
 let dismissedVersion: string | null = null;
@@ -69,6 +81,17 @@ let toastAutoHideTimer: number | null = null;
 let sliderDragging = false;
 let altOverride = false;
 let lastKnownLockState: boolean | null = null;
+let syncWin7OverlayFn: ((focusMenu?: boolean) => void) | null = null;
+let tailPickerOpen = false;
+let tailPickerStatusOverride: string | null = null;
+
+const TAIL_MODE_LABELS: Record<TailKeyMode, string> = {
+  fixed: '黑猫固定 11 键',
+  smart: '智能第三只手',
+  custom: '自定义按键',
+  edge: '近尾边缘区',
+  off: '仅摆动',
+};
 
 let settings: AppSettings = {
   x: null,
@@ -86,6 +109,8 @@ let settings: AppSettings = {
   keyboardOrientation: 'cat',
   pointerDevice: 'mouse',
   privacyPasswordGuard: true,
+  tailKeyMode: 'fixed',
+  tailKeyIds: [...DEFAULT_TAIL_KEY_IDS],
 };
 
 let catList: CatSkinConfig[] = [...DEFAULT_BUILTIN_CATS];
@@ -100,6 +125,11 @@ const updateToastTextEl = document.getElementById('update-toast-text') as HTMLSp
 const btnToastInstallEl = document.getElementById('btn-toast-install') as HTMLButtonElement;
 const btnToastOpenEl = document.getElementById('btn-toast-open') as HTMLButtonElement;
 const btnToastCloseEl = document.getElementById('btn-toast-close') as HTMLButtonElement;
+const tailPickerBarEl = document.getElementById('tail-picker-bar') as HTMLDivElement;
+const tailPickerTitleEl = document.getElementById('tail-picker-title') as HTMLSpanElement;
+const btnTailDoneEl = document.getElementById('btn-tail-done') as HTMLButtonElement;
+const tailModeBadgeEl = document.getElementById('tail-mode-badge') as HTMLSpanElement;
+const tailKeysCountEl = document.getElementById('tail-keys-count') as HTMLSpanElement;
 const engine = new KuroCatEngine(canvas, { personalDesk: true });
 
 function renderBreedPills(): void {
@@ -149,12 +179,34 @@ function syncMenuUI(): void {
 
   const kbLayout: KeyboardLayoutId = settings.keyboardLayout === '108' ? '108' : '65';
   const kbOrient: KeyboardOrientation = settings.keyboardOrientation === 'viewer' ? 'viewer' : 'cat';
+  const tailMode: TailKeyMode =
+    settings.tailKeyMode === 'smart' ||
+    settings.tailKeyMode === 'custom' ||
+    settings.tailKeyMode === 'edge' ||
+    settings.tailKeyMode === 'off'
+      ? settings.tailKeyMode
+      : 'fixed';
+  const tailIds = Array.isArray(settings.tailKeyIds) ? settings.tailKeyIds : [...DEFAULT_TAIL_KEY_IDS];
+
   document.querySelectorAll<HTMLButtonElement>('[data-kblayout]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.kblayout === kbLayout);
   });
   document.querySelectorAll<HTMLButtonElement>('[data-kborient]').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.kborient === kbOrient);
   });
+  document.querySelectorAll<HTMLButtonElement>('[data-tailmode]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.tailmode === tailMode);
+  });
+  if (tailModeBadgeEl) {
+    tailModeBadgeEl.textContent = TAIL_MODE_LABELS[tailMode];
+  }
+  if (tailKeysCountEl) {
+    tailKeysCountEl.textContent = `${tailIds.length} 键`;
+  }
+  if (tailPickerTitleEl) {
+    tailPickerTitleEl.textContent =
+      tailPickerStatusOverride || `🐾 点键帽或敲键盘开关（已选 ${tailIds.length} 键）`;
+  }
 
   const activeCat = catList.find((c) => c.id === settings.catBreed) ?? catList[0];
   renderBreedPills();
@@ -176,29 +228,112 @@ function syncMenuUI(): void {
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-pressed', String(active));
   });
+  engine.setTailKeyConfig(tailMode, tailIds);
   if (!sliderDragging) {
     engine.setRenderScale(settings.scale);
   }
   catAudio.setEnabled(settings.soundEnabled);
 }
 
+function syncWindowInteractiveState(): void {
+  const open = !menuEl.classList.contains('hidden') || tailPickerOpen;
+  void invoke('set_menu_open', { open });
+}
+
 function closeContextMenu(): void {
   if (!menuEl.classList.contains('hidden')) {
     menuEl.classList.add('hidden');
-    void invoke('set_menu_open', { open: false });
+    syncWindowInteractiveState();
+    syncWin7OverlayFn?.(false);
   }
+  void invoke('close_context_menu');
 }
 
 function openContextMenu(clientX: number, clientY: number): void {
-  syncMenuUI();
-  menuEl.classList.remove('hidden');
-  void invoke('set_menu_open', { open: true });
+  // Always pop the dedicated non-overlapping side menu window beside the cat so it NEVER blocks the pet!
+  if (!menuEl.classList.contains('hidden')) {
+    menuEl.classList.add('hidden');
+    syncWindowInteractiveState();
+    syncWin7OverlayFn?.(false);
+  }
+  void invoke('open_context_menu').catch(() => {
+    // Defensive fallback to inline menu if side-window creation ever fails on an unsupported WM
+    menuEl.classList.remove('hidden');
+    const mw = menuEl.offsetWidth || 236;
+    const mh = menuEl.offsetHeight || 360;
+    const left = Math.max(8, Math.min(window.innerWidth - mw - 8, clientX));
+    const top = Math.max(8, Math.min(window.innerHeight - mh - 8, clientY));
+    menuEl.style.left = `${left}px`;
+    menuEl.style.top = `${top}px`;
+    syncWindowInteractiveState();
+    syncWin7OverlayFn?.(true);
+  });
+}
 
-  const rect = menuEl.getBoundingClientRect();
-  const maxX = Math.max(8, window.innerWidth - rect.width - 8);
-  const maxY = Math.max(8, window.innerHeight - rect.height - 8);
-  menuEl.style.left = `${Math.max(8, Math.min(clientX, maxX))}px`;
-  menuEl.style.top = `${Math.max(8, Math.min(clientY, maxY))}px`;
+function openTailPicker(): void {
+  closeContextMenu();
+  tailPickerOpen = true;
+  tailPickerStatusOverride = null;
+  tailPickerBarEl.classList.remove('hidden');
+  engine.setTailPickerActive(true);
+  syncWindowInteractiveState();
+  if (settings.tailKeyMode !== 'custom') {
+    void applySettingsPatch({ tailKeyMode: 'custom' });
+  } else {
+    syncMenuUI();
+  }
+  requestAnimationFrame(() => syncWin7OverlayFn?.(true));
+}
+
+function closeTailPicker(): void {
+  if (!tailPickerOpen) return;
+  tailPickerOpen = false;
+  tailPickerStatusOverride = null;
+  tailPickerBarEl.classList.add('hidden');
+  canvas.classList.remove('tail-key-hover');
+  engine.setTailPickerActive(false);
+  syncWindowInteractiveState();
+  syncWin7OverlayFn?.(false);
+}
+
+function toggleTailKeyId(specId: string, label?: string): void {
+  const cur = Array.isArray(settings.tailKeyIds) ? [...settings.tailKeyIds] : [];
+  const idx = cur.indexOf(specId);
+  let added = false;
+  if (idx >= 0) {
+    cur.splice(idx, 1);
+  } else {
+    cur.push(specId);
+    added = true;
+  }
+  const keyText = label || specId.toUpperCase();
+  tailPickerStatusOverride = added
+    ? `🐾 已加「${keyText}」· 共 ${cur.length} 键`
+    : `🐾 已取消「${keyText}」· 共 ${cur.length} 键`;
+  void applySettingsPatch({ tailKeyMode: 'custom', tailKeyIds: cur });
+  if (added) {
+    engine.previewTailTap(specId);
+  }
+}
+
+function applyTailPreset(presetKey: string): void {
+  let nextIds: string[] = [];
+  let label = '已清空';
+  if (presetKey === 'office') {
+    nextIds = [...TAIL_KEY_PRESETS.office.ids];
+    label = '预设：回车空格';
+  } else if (presetKey === 'rightFn') {
+    nextIds = [...TAIL_KEY_PRESETS.rightFn.ids];
+    label = '预设：方向/小键盘';
+  } else if (presetKey === 'edgeMods') {
+    nextIds = [...TAIL_KEY_PRESETS.edgeMods.ids];
+    label = '预设：外侧功能键';
+  }
+  tailPickerStatusOverride = `🐾 ${label}（${nextIds.length} 键）`;
+  void applySettingsPatch({ tailKeyMode: 'custom', tailKeyIds: nextIds });
+  if (nextIds.length > 0) {
+    engine.previewTailTap(nextIds[0]);
+  }
 }
 
 async function applySettingsPatch(patch: Partial<AppSettings>): Promise<void> {
@@ -271,6 +406,7 @@ function hideUpdateToast(): void {
   if (!updateToastEl.classList.contains('hidden')) {
     updateToastEl.classList.add('hidden');
     void invoke('set_update_banner_open', { open: false });
+    syncWin7OverlayFn?.(false);
   }
 }
 
@@ -288,6 +424,7 @@ function showUpdateToast(
   btnToastOpenEl.classList.toggle('hidden', !options.showOpen);
   updateToastEl.classList.remove('hidden');
   void invoke('set_update_banner_open', { open: true });
+  requestAnimationFrame(() => syncWin7OverlayFn?.(false));
 
   if (options.autoHideMs && options.autoHideMs > 0) {
     toastAutoHideTimer = window.setTimeout(() => {
@@ -496,14 +633,48 @@ async function bootstrap(): Promise<void> {
     }
   });
 
+  await listen('kuro-open-tail-picker', () => {
+    openTailPicker();
+  });
+
+  await listen<number>('kuro-scale-preview', (ev) => {
+    if (typeof ev.payload === 'number' && Number.isFinite(ev.payload)) {
+      engine.setRenderScale(Math.max(0.2, Math.min(1.5, ev.payload)));
+    }
+  });
+
+  btnTailDoneEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    closeTailPicker();
+  });
+
+  tailPickerBarEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-tailpreset]');
+    if (!btn) return;
+    e.stopPropagation();
+    const preset = btn.dataset.tailpreset;
+    if (preset) applyTailPreset(preset);
+  });
+
   await listen<InputEvent>('kuro-input', (ev) => {
     const p = ev.payload;
     switch (p.kind) {
       case 'keyDown':
+        if (tailPickerOpen) {
+          if (!p.repeat) {
+            const spec = resolveKeyByVk(p.vk, settings.keyboardLayout);
+            if (spec) {
+              toggleTailKeyId(spec.id, spec.bubble || spec.label);
+            }
+          }
+          break;
+        }
         engine.onKeyDown(p.vk, p.repeat);
         break;
       case 'keyUp':
-        engine.onKeyUp(p.vk);
+        if (!tailPickerOpen) {
+          engine.onKeyUp(p.vk);
+        }
         break;
       case 'mouseMove':
         engine.onGlobalMouseMove(p.nx, p.ny);
@@ -535,10 +706,32 @@ async function bootstrap(): Promise<void> {
     canvas.classList.toggle('pet-hover', c.overCat && interactive);
   });
 
-  // Left-click drag to reposition transparent window
+  canvas.addEventListener('mousemove', (e) => {
+    if (!tailPickerOpen) return;
+    const hit = engine.hitTestKeyAtClientPoint(e.clientX, e.clientY);
+    engine.setTailPickerHover(hit ? hit.id : null);
+    canvas.classList.toggle('tail-key-hover', Boolean(hit));
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    if (!tailPickerOpen) return;
+    engine.setTailPickerHover(null);
+    canvas.classList.remove('tail-key-hover');
+  });
+
+  // Left-click keycap toggle in tail-picker mode, OR drag to reposition transparent window
   canvas.addEventListener('mousedown', async (e) => {
     if (e.button === 0) {
       closeContextMenu();
+      if (tailPickerOpen) {
+        const hit = engine.hitTestKeyAtClientPoint(e.clientX, e.clientY);
+        if (hit) {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleTailKeyId(hit.id, hit.bubble || hit.label);
+          return;
+        }
+      }
       if (settings.clickThroughLocked && !altOverride && !e.altKey) return;
       canvas.classList.add('pet-dragging');
       void invoke('set_dragging', { dragging: true });
@@ -546,6 +739,7 @@ async function bootstrap(): Promise<void> {
         await getCurrentWindow().startDragging();
       } finally {
         canvas.classList.remove('pet-dragging');
+        engine.onMouseUp('left');
         void invoke('set_dragging', { dragging: false });
         void invoke('save_window_pos');
       }
@@ -555,18 +749,21 @@ async function bootstrap(): Promise<void> {
   // Right-click opens sleek dark glass settings menu
   canvas.addEventListener('contextmenu', (e) => {
     e.preventDefault();
+    if (tailPickerOpen) {
+      closeTailPicker();
+    }
     if (settings.clickThroughLocked && !altOverride && !e.altKey) return;
     openContextMenu(e.clientX, e.clientY);
   });
 
-  window.addEventListener('blur', () => closeContextMenu());
+  // Side menu window auto-closes on its own focus loss; do NOT close on main blur (clicking the menu blurs main!)
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeContextMenu();
+    if (e.key === 'Escape' && !tailPickerOpen) closeContextMenu();
   });
 
   menuEl.addEventListener('click', (e) => {
     const target = (e.target as HTMLElement).closest<HTMLElement>(
-      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient], [data-pointerdevice]',
+      '[data-action], [data-scale], [data-breed], [data-kblayout], [data-kborient], [data-pointerdevice], [data-tailmode]',
     );
     if (!target) return;
 
@@ -588,6 +785,18 @@ async function bootstrap(): Promise<void> {
     if (pointerDevice === 'mouse' || pointerDevice === 'trackpad') {
       void applySettingsPatch({ pointerDevice });
       closeContextMenu();
+      return;
+    }
+
+    const tailModeAttr = target.dataset.tailmode;
+    if (
+      tailModeAttr === 'fixed' ||
+      tailModeAttr === 'smart' ||
+      tailModeAttr === 'custom' ||
+      tailModeAttr === 'edge' ||
+      tailModeAttr === 'off'
+    ) {
+      void applySettingsPatch({ tailKeyMode: tailModeAttr });
       return;
     }
 
@@ -637,6 +846,9 @@ async function bootstrap(): Promise<void> {
       case 'check-update':
         void triggerManualUpdateCheck();
         break;
+      case 'open-tail-picker':
+        openTailPicker();
+        break;
       case 'reset-pos':
         void invoke('reset_position');
         closeContextMenu();
@@ -646,6 +858,133 @@ async function bootstrap(): Promise<void> {
         break;
     }
   });
+
+  // On Windows 7/8 (where Microsoft WebView2 does not support DirectComposition alpha),
+  // stream the live 2D Canvas RGBA pixels via zero-copy binary IPC to a native Win32
+  // UpdateLayeredWindow(ULW_ALPHA) presenter window for true 256-level per-pixel anti-aliased
+  // transparency (zero white box, zero jagged edges) on both Aero and Win7 Basic desktops.
+  try {
+    const useWin7Ulw = await invoke<boolean>('is_win7_ulw_mode');
+    if (useWin7Ulw) {
+      document.documentElement.classList.add('win7-ulw-mode');
+      const petCtx = canvas.getContext('2d');
+      let win7Visible = true;
+      let frameBusy = false;
+      let lastPresentMs = 0;
+      let lastFrameKey = '';
+      let lastOverlayKey = '';
+
+      const syncWin7Overlay = (focusMenu = false) => {
+        const dpr = Math.max(window.devicePixelRatio || 1, 1);
+        const physW = Math.max(1, Math.round(window.innerWidth * dpr));
+        const physH = Math.max(1, Math.round(window.innerHeight * dpr));
+        const rects: number[] = [];
+
+        if (menuEl && !menuEl.classList.contains('hidden')) {
+          const r = menuEl.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) {
+            rects.push(
+              Math.max(0, Math.floor(r.left * dpr)),
+              Math.max(0, Math.floor(r.top * dpr)),
+              Math.min(physW, Math.ceil(r.right * dpr)),
+              Math.min(physH, Math.ceil(r.bottom * dpr)),
+              Math.round(12 * dpr),
+            );
+          }
+        }
+        if (tailPickerBarEl && !tailPickerBarEl.classList.contains('hidden')) {
+          const r = tailPickerBarEl.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) {
+            rects.push(
+              Math.max(0, Math.floor(r.left * dpr)),
+              Math.max(0, Math.floor(r.top * dpr)),
+              Math.min(physW, Math.ceil(r.right * dpr)),
+              Math.min(physH, Math.ceil(r.bottom * dpr)),
+              Math.round(13 * dpr),
+            );
+          }
+        }
+        if (updateToastEl && !updateToastEl.classList.contains('hidden')) {
+          const r = updateToastEl.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) {
+            const top = Math.max(0, Math.floor(r.top * dpr));
+            const bot = Math.min(physH, Math.ceil(r.bottom * dpr));
+            rects.push(
+              Math.max(0, Math.floor(r.left * dpr)),
+              top,
+              Math.min(physW, Math.ceil(r.right * dpr)),
+              bot,
+              Math.max(8, Math.round((bot - top) / 2)),
+            );
+          }
+        }
+
+        const key = rects.join(',');
+        if (!focusMenu && key === lastOverlayKey) return;
+        lastOverlayKey = key;
+        void invoke('win7_sync_overlay', { rects, focusMenu });
+      };
+      syncWin7OverlayFn = syncWin7Overlay;
+
+      await listen<{ x: number; y: number }>('kuro-win7-contextmenu', (ev) => {
+        openContextMenu(ev.payload.x, ev.payload.y);
+      });
+      await listen('kuro-win7-close-menu', () => {
+        closeContextMenu();
+      });
+      await listen<boolean>('kuro-win7-visibility', (ev) => {
+        win7Visible = Boolean(ev.payload);
+        if (win7Visible) {
+          lastFrameKey = '';
+        }
+      });
+
+      const presentWin7Frame = () => {
+        if (!win7Visible || frameBusy || !petCtx) return;
+        const now = performance.now();
+        if (now - lastPresentMs < 28) return;
+        const w = canvas.width;
+        const h = canvas.height;
+        if (w < 8 || h < 8) return;
+
+        const imgData = petCtx.getImageData(0, 0, w, h);
+        const u32 = new Uint32Array(
+          imgData.data.buffer,
+          imgData.data.byteOffset,
+          imgData.data.byteLength >>> 2,
+        );
+        let hash = 2166136261 >>> 0;
+        hash = Math.imul(hash ^ w, 16777619) >>> 0;
+        hash = Math.imul(hash ^ h, 16777619) >>> 0;
+        for (let i = 0; i < u32.length; i++) {
+          hash = Math.imul(hash ^ u32[i], 16777619) >>> 0;
+        }
+        const key = `${w}x${h}:${hash}`;
+        if (key === lastFrameKey) return;
+
+        lastFrameKey = key;
+        lastPresentMs = now;
+        frameBusy = true;
+        const payload = new Uint8Array(
+          imgData.data.buffer,
+          imgData.data.byteOffset,
+          imgData.data.byteLength,
+        );
+        void invoke('win7_present_frame', payload, {
+          headers: { 'x-w': String(w), 'x-h': String(h) },
+        }).finally(() => {
+          frameBusy = false;
+        });
+      };
+
+      engine.onAfterRender = presentWin7Frame;
+      // Kick initial presentation immediately & keep overlay bounds in sync if toast/menu resizes
+      setTimeout(presentWin7Frame, 30);
+      setInterval(() => syncWin7Overlay(false), 200);
+    }
+  } catch {
+    // Non-Win7 or unsupported: keep native transparency untouched
+  }
 }
 
 void bootstrap();

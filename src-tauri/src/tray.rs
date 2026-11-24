@@ -1,7 +1,8 @@
 use crate::config::AppSettings;
 use crate::{
     apply_breed_and_save, apply_keyboard_layout_and_save, apply_keyboard_orientation_and_save,
-    apply_scale_and_save, reset_window_position, AppState,
+    apply_scale_and_save, apply_tail_key_mode_and_save, is_pet_visible, reset_window_position,
+    set_pet_always_on_top, set_pet_visible, shutdown_pet_windows, AppState,
 };
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -19,6 +20,10 @@ fn default_tray_tooltip() -> &'static str {
 }
 
 pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
+    #[cfg(windows)]
+    let display_menu = crate::windows_display::create_menu(app)?;
+    #[cfg(target_os = "macos")]
+    let display_menu = crate::macos_window::create_display_menu(app)?;
     let toggle_show = MenuItem::with_id(app, "toggle_show", "显示 / 隐藏小黑猫", true, None::<&str>)?;
     let pause_guard = CheckMenuItem::with_id(
         app,
@@ -95,6 +100,37 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         None::<&str>,
     )?;
 
+    let obs_port = if initial.obs_port == 0 { 27421 } else { initial.obs_port };
+    let obs_toggle = CheckMenuItem::with_id(
+        app,
+        "obs_toggle",
+        format!("开启 OBS 透明直播源 (127.0.0.1:{})", obs_port),
+        true,
+        initial.obs_enabled,
+        None::<&str>,
+    )?;
+    let obs_hide_pet = CheckMenuItem::with_id(
+        app,
+        "obs_hide_pet",
+        "仅 OBS 显示（隐藏桌面猫）",
+        true,
+        initial.obs_enabled && initial.obs_hide_pet,
+        None::<&str>,
+    )?;
+    let obs_open_browser = MenuItem::with_id(
+        app,
+        "obs_open_browser",
+        "在浏览器中预览 OBS 透明源",
+        true,
+        None::<&str>,
+    )?;
+    let obs_menu = Submenu::with_items(
+        app,
+        "OBS 透明直播源",
+        true,
+        &[&obs_toggle, &obs_hide_pet, &obs_open_browser],
+    )?;
+
     let breed_black = MenuItem::with_id(app, "breed_black", "经典小黑猫", true, None::<&str>)?;
     let breed_ragdoll = MenuItem::with_id(app, "breed_ragdoll", "暖奶茶布偶猫", true, None::<&str>)?;
     let breed_orange = MenuItem::with_id(app, "breed_orange", "大橘猫（虎斑）", true, None::<&str>)?;
@@ -140,6 +176,28 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
         "键盘配列与方向",
         true,
         &[&kb_65, &kb_108, &kb_sep, &kb_cat, &kb_viewer],
+    )?;
+
+    let tail_fixed = MenuItem::with_id(app, "tail_fixed", "黑猫固定 11 键", true, None::<&str>)?;
+    let tail_smart = MenuItem::with_id(app, "tail_smart", "智能第三只手（忙时出尾）", true, None::<&str>)?;
+    let tail_custom = MenuItem::with_id(app, "tail_custom", "自定义尾巴按键", true, None::<&str>)?;
+    let tail_edge = MenuItem::with_id(app, "tail_edge", "近尾边缘区（不拆 WASD）", true, None::<&str>)?;
+    let tail_off = MenuItem::with_id(app, "tail_off", "仅摆动不拍键", true, None::<&str>)?;
+    let tail_sep = PredefinedMenuItem::separator(app)?;
+    let tail_pick = MenuItem::with_id(app, "tail_pick_keys", "🐾 在键盘上点选尾巴按键…", true, None::<&str>)?;
+    let tail_menu = Submenu::with_items(
+        app,
+        "尾巴拍键模式",
+        true,
+        &[
+            &tail_fixed,
+            &tail_smart,
+            &tail_custom,
+            &tail_edge,
+            &tail_off,
+            &tail_sep,
+            &tail_pick,
+        ],
     )?;
 
     let reset_pos = MenuItem::with_id(app, "reset_pos", "重置位置到右下角", true, None::<&str>)?;
@@ -217,10 +275,13 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             &always_on_top,
             &breed_menu,
             &kb_menu,
+            &tail_menu,
             &scale_menu,
             &desktop_shortcut,
+            &display_menu,
             &reset_pos,
             &autostart,
+            &obs_menu,
             &mcp_toggle,
             &check_update,
             &sep2,
@@ -242,10 +303,13 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             &always_on_top,
             &breed_menu,
             &kb_menu,
+            &tail_menu,
             &scale_menu,
             &mac_input_menu,
+            &display_menu,
             &reset_pos,
             &autostart,
+            &obs_menu,
             &mcp_toggle,
             &check_update,
             &sep2,
@@ -267,9 +331,11 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             &always_on_top,
             &breed_menu,
             &kb_menu,
+            &tail_menu,
             &scale_menu,
             &reset_pos,
             &autostart,
+            &obs_menu,
             &mcp_toggle,
             &check_update,
             &sep2,
@@ -294,7 +360,6 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             {
                 let app = tray.app_handle();
                 let state = app.state::<AppState>();
-                let on_top = state.settings.lock().unwrap().always_on_top;
                 if state.paused_guard.load(std::sync::atomic::Ordering::SeqCst) {
                     state
                         .paused_guard
@@ -302,23 +367,10 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     crate::input_hook::set_hooks_paused(false);
                     let _ = pause_guard_for_click.set_checked(false);
                     let _ = tray.set_tooltip(Some(default_tray_tooltip()));
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.show();
-                        #[cfg(windows)]
-                        if on_top {
-                            crate::win_gentle_reassert_topmost(&win);
-                        }
-                    }
-                } else if let Some(win) = app.get_webview_window("main") {
-                    if win.is_visible().unwrap_or(true) {
-                        let _ = win.hide();
-                    } else {
-                        let _ = win.show();
-                        #[cfg(windows)]
-                        if on_top {
-                            crate::win_gentle_reassert_topmost(&win);
-                        }
-                    }
+                    set_pet_visible(app, true);
+                } else {
+                    let vis = is_pet_visible(app);
+                    set_pet_visible(app, !vis);
                 }
             }
         })
@@ -326,7 +378,6 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             let state = app.state::<AppState>();
             match event.id().as_ref() {
                 "toggle_show" => {
-                    let on_top = state.settings.lock().unwrap().always_on_top;
                     if state.paused_guard.load(std::sync::atomic::Ordering::SeqCst) {
                         state
                             .paused_guard
@@ -336,23 +387,19 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         if let Some(tray) = app.tray_by_id("kuro-tray") {
                             let _ = tray.set_tooltip(Some(default_tray_tooltip()));
                         }
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            #[cfg(windows)]
-                            if on_top {
-                                crate::win_gentle_reassert_topmost(&win);
+                        set_pet_visible(app, true);
+                    } else {
+                        let next_vis = !is_pet_visible(app);
+                        if next_vis {
+                            let mut s = state.settings.lock().unwrap();
+                            if s.obs_hide_pet {
+                                s.obs_hide_pet = false;
+                                crate::config::save_settings(&s);
+                                let _ = obs_hide_pet.set_checked(false);
+                                let _ = app.emit("kuro-settings", s.clone());
                             }
                         }
-                    } else if let Some(win) = app.get_webview_window("main") {
-                        if win.is_visible().unwrap_or(true) {
-                            let _ = win.hide();
-                        } else {
-                            let _ = win.show();
-                            #[cfg(windows)]
-                            if on_top {
-                                crate::win_gentle_reassert_topmost(&win);
-                            }
-                        }
+                        set_pet_visible(app, next_vis);
                     }
                 }
                 "pause_guard" => {
@@ -372,17 +419,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         };
                         let _ = tray.set_tooltip(Some(tip));
                     }
-                    if let Some(win) = app.get_webview_window("main") {
-                        if next {
-                            let _ = win.hide();
-                        } else {
-                            let _ = win.show();
-                            #[cfg(windows)]
-                            if state.settings.lock().unwrap().always_on_top {
-                                crate::win_gentle_reassert_topmost(&win);
-                            }
-                        }
-                    }
+                    set_pet_visible(app, !next);
                 }
                 #[cfg(windows)]
                 "restart_as_admin" => {
@@ -423,17 +460,16 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     let _ = app.emit("kuro-settings", s.clone());
                 }
                 "always_on_top" => {
-                    let mut s = state.settings.lock().unwrap();
-                    s.always_on_top = !s.always_on_top;
-                    let on_top = s.always_on_top;
-                    crate::config::save_settings(&s);
+                    let (on_top, updated) = {
+                        let mut s = state.settings.lock().unwrap();
+                        s.always_on_top = !s.always_on_top;
+                        let on_top = s.always_on_top;
+                        crate::config::save_settings(&s);
+                        (on_top, s.clone())
+                    };
                     let _ = always_on_top.set_checked(on_top);
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.set_always_on_top(on_top);
-                        #[cfg(target_os = "macos")]
-                        crate::configure_macos_fullscreen_overlay(&win, on_top);
-                    }
-                    let _ = app.emit("kuro-settings", s.clone());
+                    set_pet_always_on_top(app, on_top);
+                    let _ = app.emit("kuro-settings", updated);
                 }
                 "autostart" => {
                     let mut s = state.settings.lock().unwrap();
@@ -444,6 +480,71 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                         let _ = autostart.set_checked(next);
                         let _ = app.emit("kuro-settings", s.clone());
                     }
+                }
+                "obs_toggle" => {
+                    let (enabled, port, updated) = {
+                        let mut s = state.settings.lock().unwrap();
+                        s.obs_enabled = !s.obs_enabled;
+                        if !s.obs_enabled {
+                            s.obs_hide_pet = false;
+                        }
+                        if s.obs_port == 0 {
+                            s.obs_port = 27421;
+                        }
+                        crate::config::save_settings(&s);
+                        (s.obs_enabled, s.obs_port, s.clone())
+                    };
+                    crate::obs::sync_obs_server(app, enabled, port);
+                    let _ = obs_toggle.set_checked(enabled);
+                    if !enabled {
+                        let _ = obs_hide_pet.set_checked(false);
+                        if !state.paused_guard.load(std::sync::atomic::Ordering::Relaxed) {
+                            set_pet_visible(app, true);
+                        }
+                    }
+                    let _ = app.emit("kuro-settings", updated);
+                }
+                "obs_hide_pet" => {
+                    let (hide_now, port, updated) = {
+                        let mut s = state.settings.lock().unwrap();
+                        let next_hide = !(s.obs_enabled && s.obs_hide_pet);
+                        if next_hide && !s.obs_enabled {
+                            s.obs_enabled = true;
+                        }
+                        if s.obs_port == 0 {
+                            s.obs_port = 27421;
+                        }
+                        s.obs_hide_pet = next_hide;
+                        crate::config::save_settings(&s);
+                        (next_hide, s.obs_port, s.clone())
+                    };
+                    crate::obs::sync_obs_server(app, updated.obs_enabled, port);
+                    let _ = obs_toggle.set_checked(updated.obs_enabled);
+                    let _ = obs_hide_pet.set_checked(hide_now);
+                    if !state.paused_guard.load(std::sync::atomic::Ordering::Relaxed) {
+                        set_pet_visible(app, !hide_now);
+                    }
+                    let _ = app.emit("kuro-settings", updated);
+                }
+                "obs_open_browser" => {
+                    let (port, enabled_changed, updated) = {
+                        let mut s = state.settings.lock().unwrap();
+                        if s.obs_port == 0 {
+                            s.obs_port = 27421;
+                        }
+                        let changed = !s.obs_enabled;
+                        if changed {
+                            s.obs_enabled = true;
+                            crate::config::save_settings(&s);
+                        }
+                        (s.obs_port, changed, s.clone())
+                    };
+                    crate::obs::sync_obs_server(app, true, port);
+                    if enabled_changed {
+                        let _ = obs_toggle.set_checked(true);
+                        let _ = app.emit("kuro-settings", updated);
+                    }
+                    crate::updater::open_url_in_browser(&crate::obs::obs_url(port));
                 }
                 "mcp_toggle" => {
                     let mut s = state.settings.lock().unwrap();
@@ -473,6 +574,15 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                 "kb_108" => apply_keyboard_layout_and_save(app, "108"),
                 "kb_cat" => apply_keyboard_orientation_and_save(app, "cat"),
                 "kb_viewer" => apply_keyboard_orientation_and_save(app, "viewer"),
+                "tail_fixed" => apply_tail_key_mode_and_save(app, "fixed"),
+                "tail_smart" => apply_tail_key_mode_and_save(app, "smart"),
+                "tail_custom" => apply_tail_key_mode_and_save(app, "custom"),
+                "tail_edge" => apply_tail_key_mode_and_save(app, "edge"),
+                "tail_off" => apply_tail_key_mode_and_save(app, "off"),
+                "tail_pick_keys" => {
+                    set_pet_visible(app, true);
+                    let _ = app.emit("kuro-open-tail-picker", ());
+                }
                 "desktop_shortcut" => {
                     let _ = crate::config::create_desktop_shortcut();
                 }
@@ -494,9 +604,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                 }
                 "check_update" => {
                     let app_clone = app.clone();
-                    if let Some(win) = app.get_webview_window("main") {
-                        let _ = win.show();
-                    }
+                    set_pet_visible(app, true);
                     let _ = app_clone.emit(
                         "kuro-update-status",
                         crate::updater::UpdateProgressEvent {
@@ -535,9 +643,15 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                 }
                 "reset_pos" => reset_window_position(app),
                 "quit" => {
+                    shutdown_pet_windows();
                     app.exit(0);
                 }
-                _ => {}
+                _ => {
+                    #[cfg(windows)]
+                    crate::windows_display::handle_menu(app, event.id().as_ref());
+                    #[cfg(target_os = "macos")]
+                    crate::macos_window::handle_display_menu(app, event.id().as_ref());
+                }
             }
         })
         .build(app)?;

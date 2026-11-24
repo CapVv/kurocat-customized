@@ -13,6 +13,7 @@ export interface PawState {
   target: Vec2;
   pokeTime: number;
   impact: number;
+  lastActiveAt: number;
   squash: number;
   curl: number;
   crease: number;
@@ -23,7 +24,7 @@ export interface PawState {
 export function createPaw(side: PawState['side'], resting: Vec2): PawState {
   return {
     side, mode: 'idle', pos: { ...resting }, vel: { x: 0, y: 0 }, target: { ...resting },
-    pokeTime: 0, impact: 0, squash: 0, curl: 0.7, crease: 0, exposure: 0, restingLineOpacity: 1,
+    pokeTime: 0, impact: 0, lastActiveAt: -10000, squash: 0, curl: 0.7, crease: 0, exposure: 0, restingLineOpacity: 1,
   };
 }
 

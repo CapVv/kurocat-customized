@@ -16,8 +16,20 @@ fn default_privacy_password_guard() -> bool {
 
 pub const TRACKPAD_PREVIEW: bool = option_env!("KUROCAT_TRACKPAD_PREVIEW").is_some();
 
-fn default_mcp_port() -> u16 {
+pub fn default_mcp_port() -> u16 {
     if TRACKPAD_PREVIEW { 27421 } else { 27420 }
+}
+
+fn default_obs_enabled() -> bool {
+    false
+}
+
+pub fn default_obs_port() -> u16 {
+    if TRACKPAD_PREVIEW { 27422 } else { 27421 }
+}
+
+fn default_obs_hide_pet() -> bool {
+    false
 }
 
 pub fn default_keyboard_layout() -> String {
@@ -61,11 +73,60 @@ impl Default for PointerDevice {
     }
 }
 
+pub fn default_tail_key_mode() -> String {
+    "fixed".to_string()
+}
+
+pub fn normalize_tail_key_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "custom" => "custom".to_string(),
+        "edge" => "edge".to_string(),
+        "off" => "off".to_string(),
+        "smart" => "smart".to_string(),
+        _ => default_tail_key_mode(),
+    }
+}
+
+pub fn default_tail_key_ids() -> Vec<String> {
+    vec![
+        "enter".to_string(),
+        "space".to_string(),
+        "bs".to_string(),
+        "esc".to_string(),
+    ]
+}
+
+pub fn normalize_tail_key_ids(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(raw.len().min(120));
+    for item in raw {
+        let clean: String = item
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(24)
+            .collect();
+        if !clean.is_empty() && !out.contains(&clean) {
+            out.push(clean);
+            if out.len() >= 120 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub x: Option<i32>,
     pub y: Option<i32>,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_id: Option<String>,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows_display_id: Option<String>,
     pub scale: f64,
     pub always_on_top: bool,
     pub click_through_locked: bool,
@@ -86,6 +147,16 @@ pub struct AppSettings {
     pub pointer_device: PointerDevice,
     #[serde(default = "default_privacy_password_guard")]
     pub privacy_password_guard: bool,
+    #[serde(default = "default_tail_key_mode")]
+    pub tail_key_mode: String,
+    #[serde(default = "default_tail_key_ids")]
+    pub tail_key_ids: Vec<String>,
+    #[serde(default = "default_obs_enabled")]
+    pub obs_enabled: bool,
+    #[serde(default = "default_obs_port")]
+    pub obs_port: u16,
+    #[serde(default = "default_obs_hide_pet")]
+    pub obs_hide_pet: bool,
 }
 
 impl Default for AppSettings {
@@ -93,6 +164,10 @@ impl Default for AppSettings {
         Self {
             x: None,
             y: None,
+            #[cfg(target_os = "macos")]
+            display_id: None,
+            #[cfg(windows)]
+            windows_display_id: None,
             scale: 1.0,
             always_on_top: true,
             click_through_locked: false,
@@ -106,6 +181,11 @@ impl Default for AppSettings {
             keyboard_orientation: default_keyboard_orientation(),
             pointer_device: PointerDevice::default(),
             privacy_password_guard: default_privacy_password_guard(),
+            tail_key_mode: default_tail_key_mode(),
+            tail_key_ids: default_tail_key_ids(),
+            obs_enabled: default_obs_enabled(),
+            obs_port: default_obs_port(),
+            obs_hide_pet: default_obs_hide_pet(),
         }
     }
 }
@@ -144,6 +224,8 @@ pub fn load_settings() -> AppSettings {
     if let Ok(content) = fs::read_to_string(&path) {
         if let Ok(mut parsed) = serde_json::from_str::<AppSettings>(&content) {
             parsed.scale = parsed.scale.clamp(0.20, 1.50);
+            parsed.tail_key_mode = normalize_tail_key_mode(&parsed.tail_key_mode);
+            parsed.tail_key_ids = normalize_tail_key_ids(&parsed.tail_key_ids);
             return parsed;
         }
     }
@@ -270,8 +352,42 @@ pub fn set_windows_autostart(enabled: bool) -> Result<(), String> {
 }
 
 #[cfg(all(not(windows), not(target_os = "macos")))]
-pub fn set_windows_autostart(_enabled: bool) -> Result<(), String> {
-    Ok(())
+pub fn set_windows_autostart(enabled: bool) -> Result<(), String> {
+    let config_root = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".config")
+        });
+    let autostart_dir = config_root.join("autostart");
+    let desktop_path = autostart_dir.join("kurocat.desktop");
+
+    if enabled {
+        fs::create_dir_all(&autostart_dir).map_err(|e| e.to_string())?;
+        let exe = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .to_string();
+        let entry = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=KuroCat\n\
+             Comment=Minimalist desktop cat typing & mouse companion\n\
+             Exec=\"{exe}\"\n\
+             Icon=KuroCat\n\
+             Terminal=false\n\
+             X-GNOME-Autostart-enabled=true\n",
+            exe = exe.replace('"', "\\\"")
+        );
+        fs::write(desktop_path, entry).map_err(|e| e.to_string())
+    } else {
+        if desktop_path.exists() {
+            let _ = fs::remove_file(desktop_path);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -325,4 +441,50 @@ pub fn create_desktop_shortcut() -> Result<String, String> {
 #[cfg(not(windows))]
 pub fn create_desktop_shortcut() -> Result<String, String> {
     Ok("Desktop shortcut is managed via Applications on this OS".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_key_mode_normalizes_safely() {
+        assert_eq!(normalize_tail_key_mode("smart"), "smart");
+        assert_eq!(normalize_tail_key_mode(" CUSTOM "), "custom");
+        assert_eq!(normalize_tail_key_mode("edge"), "edge");
+        assert_eq!(normalize_tail_key_mode("OFF"), "off");
+        assert_eq!(normalize_tail_key_mode("invalid"), "fixed");
+    }
+
+    #[test]
+    fn tail_key_ids_dedupes_and_sanitizes() {
+        let raw = vec![
+            "Enter".to_string(),
+            " enter ".to_string(),
+            "NP_0".to_string(),
+            "bad-key!$".to_string(),
+            "".to_string(),
+        ];
+        assert_eq!(
+            normalize_tail_key_ids(&raw),
+            vec!["enter".to_string(), "np_0".to_string(), "badkey".to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_deserializes_with_tail_defaults() {
+        let legacy = r#"{
+            "x": null,
+            "y": null,
+            "scale": 1.0,
+            "alwaysOnTop": true,
+            "clickThroughLocked": false,
+            "showKeyBubbles": true,
+            "soundEnabled": true,
+            "autostart": false
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("legacy json should parse");
+        assert_eq!(parsed.tail_key_mode, "fixed");
+        assert_eq!(parsed.tail_key_ids, default_tail_key_ids());
+    }
 }
